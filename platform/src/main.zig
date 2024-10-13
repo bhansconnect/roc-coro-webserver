@@ -12,23 +12,13 @@ pub const coro_options: coro.Options = .{
 };
 
 pub const std_options: std.Options = .{
-    .log_level = .err,
+    .log_level = .info,
 };
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();
 
-    var scheduler = try coro.Scheduler.init(gpa.allocator(), .{});
-    defer scheduler.deinit();
-    var tpool: coro.ThreadPool = try coro.ThreadPool.init(gpa.allocator(), .{ .max_threads = 4 });
-    defer tpool.deinit();
-
-    _ = try scheduler.spawn(server, .{ &scheduler, &tpool }, .{});
-    try scheduler.run(.wait);
-}
-
-fn server(scheduler: *coro.Scheduler, tpool: *coro.ThreadPool) !void {
     var socket: std.posix.socket_t = undefined;
     try coro.io.single(aio.Socket{
         .domain = std.posix.AF.INET,
@@ -45,17 +35,39 @@ fn server(scheduler: *coro.Scheduler, tpool: *coro.ThreadPool) !void {
     try std.posix.bind(socket, &address.any, address.getOsSockLen());
     try std.posix.listen(socket, 128);
 
+    var threads = try gpa.allocator().alloc(std.Thread, 4);
+    for (0..4) |i| {
+        threads[i] = try std.Thread.spawn(.{}, server_thread, .{ i, gpa.allocator(), socket });
+    }
+    for (0..4) |i| {
+        threads[i].join();
+    }
+}
+
+// This really should be some sort of fancier work stealing scheduler/thread pool.
+// Instead, it is one scheduler per thread.
+// Also schedulers attempt to accept any incoming connections.
+fn server_thread(thread_id: usize, allocator: std.mem.Allocator, socket: std.posix.socket_t) !void {
+    var scheduler = try coro.Scheduler.init(allocator, .{});
+    defer scheduler.deinit();
+
+    _ = try scheduler.spawn(accept_requests, .{ thread_id, &scheduler, socket }, .{});
+
+    try scheduler.run(.wait);
+}
+
+fn accept_requests(thread_id: usize, scheduler: *coro.Scheduler, socket: std.posix.socket_t) !void {
     while (true) {
         var client_sock: std.posix.socket_t = undefined;
         try coro.io.single(aio.Accept{ .socket = socket, .out_socket = &client_sock });
 
-        _ = try tpool.spawnForCompletition(scheduler, handler, .{client_sock}, .{});
+        _ = try scheduler.spawn(handler, .{ thread_id, client_sock }, .{});
     }
 }
 
-fn handler(client_sock: std.posix.socket_t) !void {
-    log.info("Starting new handler\n", .{});
-    defer log.info("Closing handler\n", .{});
+fn handler(thread_id: usize, client_sock: std.posix.socket_t) !void {
+    log.info("Starting new handler on {}\n", .{thread_id});
+    defer log.info("Closing handler on {}\n", .{thread_id});
 
     // I should do a proper check for keepalive here?
     // And http headers in general I guess.
@@ -63,14 +75,14 @@ fn handler(client_sock: std.posix.socket_t) !void {
     var len: usize = 0;
     while (true) {
         try coro.io.single(aio.Recv{ .socket = client_sock, .buffer = &buf, .out_read = &len });
-        // Would check the header for keep alive here and inter a loop if so.
-        // Otherwise, this is where we would handle http or just hand bytes off to roc.
-        // Not sure best way to handle a request size limit.
         log.debug("request:\n{s}\n\n", .{buf[0..len]});
+
+        // This is the costly part, sleep for a bit (pretend this is some server web request)
+        // Sleep 20ms
+        try coro.io.single(aio.Timeout{ .ns = 20 * 1_000 * 1_000 });
 
         const response =
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 13\r\n\r\nHello, World!";
         try coro.io.single(aio.Send{ .socket = client_sock, .buffer = response });
     }
-    // try coro.io.single(aio.CloseSocket{ .socket = client_sock });
 }
