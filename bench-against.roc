@@ -10,7 +10,7 @@ server = { init: Task.ok {}, respond }
 respond : Request, Model -> Task Response [ServerErr Str]_
 respond = \_req, _ ->
     # This is the costly part, sleep for a bit (pretend this is some server web request)
-    Sleep 20ms
+    # Sleep 20ms
 
     Sleep.millis! 20
 
