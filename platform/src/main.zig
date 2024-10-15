@@ -1,5 +1,6 @@
 const std = @import("std");
 const xev = @import("xev");
+const coro = @import("coro.zig");
 const log = std.log.scoped(.platform);
 const Allocator = std.mem.Allocator;
 
@@ -50,6 +51,9 @@ pub fn main() !void {
             // Another thread would eventual take the connection and handle it.
             // Note, the first thing a callback will do is probably read...
             // So we may want to read here no matter what.
+            // Actually, these wouldn't go straight to the global queue
+            // Whichever thread runs the event loop will get a list of requests returned to it.
+            // That thread will add it to whatever queue is necessary.
 
             // For now, staying single threaded.
             // Add a new completion to handle the request.
@@ -81,6 +85,8 @@ const Handler = struct {
         rb: xev.ReadBuffer,
         len_result: xev.ReadError!usize,
     ) xev.CallbackAction {
+        var d: [21]u64 = undefined;
+        coro.switch_context(&d, &d);
         const len = len_result catch |err| {
             // I'm not sure this is correct, but I think we need to retry on would block.
             // Feels like something that libxev should handle on its own.
@@ -123,6 +129,8 @@ const Handler = struct {
         wb: xev.WriteBuffer,
         len_result: xev.WriteError!usize,
     ) xev.CallbackAction {
+        var d: [21]u64 = undefined;
+        coro.switch_context(&d, &d);
         const len = len_result catch |err| {
             // I'm not sure this is correct, but I think we need to retry on would block.
             // Feels like something that libxev should handle on its own.
@@ -158,6 +166,8 @@ const Handler = struct {
         _: xev.TCP,
         _: xev.ShutdownError!void,
     ) xev.CallbackAction {
+        var d: [21]u64 = undefined;
+        coro.switch_context(&d, &d);
         // If shutdowns fails, should this retry?
         allocator.destroy(self.?);
         return .disarm;
