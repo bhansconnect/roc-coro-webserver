@@ -14,9 +14,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const zig_aio = b.dependency("zig-aio", .{});
-    exe.root_module.addImport("aio", zig_aio.module("aio"));
-    exe.root_module.addImport("coro", zig_aio.module("coro"));
+    const libxev = b.dependency("libxev", .{});
+    exe.root_module.addImport("xev", libxev.module("xev"));
 
     b.installArtifact(exe);
 
