@@ -87,7 +87,7 @@ const Handler = struct {
             if (err == error.WouldBlock) {
                 return .rearm;
             }
-            if (err != error.ConnectionResetByPeer and err != error.EOF) {
+            if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
                 log.warn("Failed to read from tcp connection: {}", .{err});
             }
             self.?.close(loop, socket);
@@ -129,7 +129,7 @@ const Handler = struct {
             if (err == error.WouldBlock) {
                 return .rearm;
             }
-            if (err != error.ConnectionResetByPeer and err != error.EOF) {
+            if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
                 log.warn("Failed to write to tcp connection: {}", .{err});
             }
             self.?.close(loop, socket);
