@@ -1,43 +1,46 @@
 const std = @import("std");
 const xev = @import("xev");
 const coro = @import("coro.zig");
-const log = std.log.scoped(.platform);
-const Allocator = std.mem.Allocator;
 
+const Allocator = std.mem.Allocator;
+const Coroutine = coro.Coroutine;
+const Poller = @import("poller.zig").Poller;
+const Scheduler = @import("scheduler.zig").Scheduler;
+
+const log = std.log.scoped(.platform);
 pub const std_options: std.Options = .{
-    .log_level = .info,
+    .log_level = .debug,
 };
 
 var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
 var allocator: Allocator = gpa.allocator();
 
-pub fn main() !void {
-    // TODO: make the loop global.
-    // It will be run by any thread without work or the system monitor.
-    var root_loop = try xev.Loop.init(.{});
-    defer root_loop.deinit();
+var poller: Poller = undefined;
+var sched: Scheduler = undefined;
 
-    // For now just run the socket accepting single threaded.
+pub fn main() !void {
+    poller = try Poller.init(allocator);
+    sched = Scheduler.init(allocator);
+
+    // Setup the socket.
     var address = try std.net.Address.parseIp4("127.0.0.1", 8000);
     const server = try xev.TCP.init(address);
-
-    // Bind and listen
     try server.bind(address);
     try server.listen(128);
 
     // Is this needed? I think it is getting the port.
     // But we specify a specific port...
     const fd = if (xev.backend == .iocp) @as(std.os.windows.ws2_32.SOCKET, @ptrCast(server.fd)) else server.fd;
-    var sock_len = address.getOsSockLen();
-    try std.posix.getsockname(fd, &address.any, &sock_len);
+    var socket_len = address.getOsSockLen();
+    try std.posix.getsockname(fd, &address.any, &socket_len);
     log.info("Starting server at: http://{}", .{address});
 
-    // Setup accepting connections
+    // Setup accepting connections.
     var c_accept: xev.Completion = undefined;
-    server.accept(&root_loop, &c_accept, void, null, (struct {
+    server.accept(&poller.loop, &c_accept, void, null, (struct {
         fn callback(
             _: ?*void,
-            loop: *xev.Loop,
+            _: *xev.Loop,
             _: *xev.Completion,
             accept_result: xev.AcceptError!xev.TCP,
         ) xev.CallbackAction {
@@ -46,25 +49,63 @@ pub fn main() !void {
                 return .rearm;
             };
             log.debug("Accepting new TCP connection", .{});
-            // Theoretically here we would queue a coroutine.
-            // Just push into the global queue.
-            // Another thread would eventual take the connection and handle it.
-            // Note, the first thing a callback will do is probably read...
-            // So we may want to read here no matter what.
-            // Actually, these wouldn't go straight to the global queue
-            // Whichever thread runs the event loop will get a list of requests returned to it.
-            // That thread will add it to whatever queue is necessary.
 
-            // For now, staying single threaded.
-            // Add a new completion to handle the request.
-            // This should probably be pooled instead of just allocating a new instance.
-            var handler = allocator.create(Handler) catch unreachable;
-            socket.read(loop, &handler.completion, .{ .slice = &handler.buffer }, Handler, handler, Handler.read_callback);
+            const c = Coroutine.init(xev.TCP, struct {
+                fn handler(_: xev.TCP) void {
+                    log.debug("launched coroutine!!!", .{});
+                }
+            }.handler, socket) catch |err| {
+                log.err("Failed to create coroutine: {}", .{err});
+                return .rearm;
+            };
+            // To keep things simple for now, just dump directly to the global queue.
+            sched.lock.lock();
+            sched.queue.push(c) catch |err| {
+                sched.lock.unlock();
+                log.err("Failed to queue coroutine: {}", .{err});
+                c.deinit();
+                return .rearm;
+            };
+            sched.lock.unlock();
+
+            // poller.readyCoroutines.append(c) catch |err| {
+            //     log.err("Failed to queue coroutine: {}", .{err});
+            //     c.deinit();
+            //     return .rearm;
+            // };
+            // var handler = allocator.create(Handler) catch unreachable;
+            // socket.read(&poller.loop, &handler.completion, .{ .slice = &handler.buffer }, Handler, handler, Handler.read_callback);
             return .rearm;
         }
     }).callback);
 
-    try root_loop.run(.until_done);
+    _ = try std.Thread.spawn(.{}, run_coroutines, .{});
+    try poller.loop.run(.until_done);
+}
+
+fn run_coroutines() !void {
+    while (true) {
+        sched.lock.lock();
+        const c = sched.pop() catch {
+            sched.lock.unlock();
+            // Sleep for 100 microseconds to avoid bashing the scheduler lock.
+            std.posix.nanosleep(0, 100 * 1000);
+            continue;
+        };
+        sched.lock.unlock();
+
+        coro.switch_context(c);
+        switch (c.state) {
+            .active => {
+                sched.lock.lock();
+                try sched.push(c);
+                sched.lock.unlock();
+            },
+            .done => {
+                c.deinit();
+            },
+        }
+    }
 }
 
 const Handler = struct {
