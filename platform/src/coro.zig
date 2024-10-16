@@ -16,12 +16,21 @@ const Allocator = std.mem.Allocator;
 
 extern fn switch_context_impl(current: [*]u64, target: [*]u64) void;
 comptime {
-    asm (@embedFile("asm/aarch64.s"));
+    switch (builtin.cpu.arch) {
+        .aarch64 => {
+            asm (@embedFile("asm/aarch64.s"));
+        },
+        .x86_64 => {
+            asm (@embedFile("asm/x86_64.s"));
+        },
+        else => @compileError("Unsupported cpu architecture"),
+    }
 }
 
 const context_size =
     switch (builtin.cpu.arch) {
     .aarch64 => 21,
+    .x86_64 => 7,
     else => @compileError("Unsupported cpu architecture"),
 };
 
@@ -105,12 +114,30 @@ pub const Coroutine = struct {
         for (0..c.context.len) |i| {
             c.context[i] = 0;
         }
-        const frame_pointer_index = 18;
-        const return_pointer_index = 19;
-        const stack_pointer_index = 20;
-        c.context[stack_pointer_index] = @intFromPtr(sp);
-        c.context[frame_pointer_index] = @intFromPtr(sp);
-        c.context[return_pointer_index] = @intFromPtr(&coroutine_wrapper);
+        switch (builtin.cpu.arch) {
+            .aarch64 => {
+                const frame_pointer_index = 18;
+                const return_pointer_index = 19;
+                const stack_pointer_index = 20;
+                c.context[stack_pointer_index] = @intFromPtr(sp);
+                c.context[frame_pointer_index] = @intFromPtr(sp);
+                c.context[return_pointer_index] = @intFromPtr(&coroutine_wrapper);
+            },
+            .x86_64 => {
+                // Makes space to store the return address on the stack.
+                sp -= @sizeOf(usize);
+                sp = @ptrFromInt(@intFromPtr(sp) & ~@as(usize, (STACK_ALIGN - 1)));
+
+                const return_address_ptr = @as(*usize, @alignCast(@ptrCast(sp)));
+                return_address_ptr.* = @intFromPtr(&coroutine_wrapper);
+
+                const frame_pointer_index = 5;
+                const stack_pointer_index = 6;
+                c.context[stack_pointer_index] = @intFromPtr(sp);
+                c.context[frame_pointer_index] = @intFromPtr(sp);
+            },
+            else => @compileError("Unsupported cpu architecture"),
+        }
         c.state = .active;
 
         return c;
