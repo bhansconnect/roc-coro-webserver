@@ -4,6 +4,8 @@ const queue = @import("queue.zig");
 
 const Allocator = std.mem.Allocator;
 
+pub var scheduler: Scheduler = undefined;
+
 // All scheduling state.
 pub const Scheduler = struct {
     const Self = @This();

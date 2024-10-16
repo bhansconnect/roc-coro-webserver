@@ -4,8 +4,6 @@ const coro = @import("coro.zig");
 
 const Allocator = std.mem.Allocator;
 const Coroutine = coro.Coroutine;
-const Poller = @import("poller.zig").Poller;
-const Scheduler = @import("scheduler.zig").Scheduler;
 
 const log = std.log.scoped(.platform);
 pub const std_options: std.Options = .{
@@ -15,12 +13,14 @@ pub const std_options: std.Options = .{
 var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
 var allocator: Allocator = gpa.allocator();
 
-var poller: Poller = undefined;
-var sched: Scheduler = undefined;
+const Poller = @import("poller.zig").Poller;
+var poller = &@import("poller.zig").poller;
+const Scheduler = @import("scheduler.zig").Scheduler;
+var scheduler = &@import("scheduler.zig").scheduler;
 
 pub fn main() !void {
-    poller = try Poller.init(allocator);
-    sched = Scheduler.init(allocator);
+    poller.* = try Poller.init(allocator);
+    scheduler.* = Scheduler.init(allocator);
 
     // Setup the socket.
     var address = try std.net.Address.parseIp4("127.0.0.1", 8000);
@@ -36,8 +36,8 @@ pub fn main() !void {
     log.info("Starting server at: http://{}", .{address});
 
     // Setup accepting connections.
-    var c_accept: xev.Completion = undefined;
-    server.accept(&poller.loop, &c_accept, void, null, (struct {
+    var completion: xev.Completion = undefined;
+    server.accept(&poller.loop, &completion, void, null, (struct {
         fn callback(
             _: ?*void,
             _: *xev.Loop,
@@ -50,23 +50,14 @@ pub fn main() !void {
             };
             log.debug("Accepting new TCP connection", .{});
 
-            const c = Coroutine.init(xev.TCP, struct {
-                fn handler(_: xev.TCP) void {
-                    log.debug("launched coroutine!!!", .{});
-                }
-            }.handler, socket) catch |err| {
+            const c = Coroutine.init(xev.TCP, handle_tcp_requests, socket) catch |err| {
                 log.err("Failed to create coroutine: {}", .{err});
                 return .rearm;
             };
             // To keep things simple for now, just dump directly to the global queue.
-            sched.lock.lock();
-            sched.queue.push(c) catch |err| {
-                sched.lock.unlock();
-                log.err("Failed to queue coroutine: {}", .{err});
-                c.deinit();
-                return .rearm;
-            };
-            sched.lock.unlock();
+            scheduler.lock.lock();
+            scheduler.queue.push(c) catch unreachable;
+            scheduler.lock.unlock();
 
             // poller.readyCoroutines.append(c) catch |err| {
             //     log.err("Failed to queue coroutine: {}", .{err});
@@ -79,27 +70,45 @@ pub fn main() !void {
         }
     }).callback);
 
-    _ = try std.Thread.spawn(.{}, run_coroutines, .{});
-    try poller.loop.run(.until_done);
+    for (0..4) |i| {
+        _ = try std.Thread.spawn(.{}, run_coroutines, .{i});
+    }
+
+    // For now, just running the poller in its own thread for simplicity.
+    while (true) {
+        // Sleep for 100 microseconds to avoid bashing the poller lock.
+        std.posix.nanosleep(0, 100 * 1000);
+        poller.lock.lock();
+        try poller.loop.run(.no_wait);
+        poller.lock.unlock();
+    }
 }
 
-fn run_coroutines() !void {
+threadlocal var thread_id: usize = undefined;
+
+fn run_coroutines(i: usize) !void {
+    thread_id = i;
+    log.info("Launching executor thread: {}", .{thread_id});
     while (true) {
-        sched.lock.lock();
-        const c = sched.pop() catch {
-            sched.lock.unlock();
+        scheduler.lock.lock();
+        const c = scheduler.pop() catch {
+            scheduler.lock.unlock();
             // Sleep for 100 microseconds to avoid bashing the scheduler lock.
             std.posix.nanosleep(0, 100 * 1000);
             continue;
         };
-        sched.lock.unlock();
+        scheduler.lock.unlock();
 
         coro.switch_context(c);
         switch (c.state) {
             .active => {
-                sched.lock.lock();
-                try sched.push(c);
-                sched.lock.unlock();
+                scheduler.lock.lock();
+                try scheduler.push(c);
+                scheduler.lock.unlock();
+            },
+            .awaiting_io => {
+                // Nothing to do.
+                // Coroutine will have put itself in the poller.
             },
             .done => {
                 c.deinit();
@@ -108,109 +117,145 @@ fn run_coroutines() !void {
     }
 }
 
-const Handler = struct {
-    const Self = @This();
+fn handle_tcp_requests(socket: xev.TCP) void {
+    log.debug("Launched coroutine on thread: {}", .{thread_id});
+    defer socket_close(socket);
 
-    // These all could theoretically go straight on the stack of the new coroutine.
-    completion: xev.Completion,
-    buffer: [4096]u8,
+    var buffer: [4096]u8 = undefined;
 
-    // With coroutines, the callbacks won't actually do anything with the data.
-    // They will just register the coroutine state change and push the coroutine into the global queue.
-
-    fn read_callback(
-        self: ?*Self,
-        loop: *xev.Loop,
-        _: *xev.Completion,
-        socket: xev.TCP,
-        rb: xev.ReadBuffer,
-        len_result: xev.ReadError!usize,
-    ) xev.CallbackAction {
-        var d: [21]u64 = undefined;
-        coro.switch_context(&d, &d);
-        const len = len_result catch |err| {
-            // I'm not sure this is correct, but I think we need to retry on would block.
-            // Feels like something that libxev should handle on its own.
-            if (err == error.WouldBlock) {
-                return .rearm;
-            }
-            if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
-                log.warn("Failed to read from tcp connection: {}", .{err});
-            }
-            self.?.close(loop, socket);
-            return .disarm;
-        };
+    // We technically should be checking keepalive, but for now, just loop.
+    while (true) {
+        var read_len: usize = 0;
         // TODO: handle partial reads.
-        // I'm a bit suprised that reading 0 bytes doesn't count as would block.
-        if (len == 0) {
-            return .rearm;
+        // For now just re-read on any empty reads.
+        while (read_len == 0) {
+            const result = socket_read(socket, &buffer);
+            read_len = result catch |err| {
+                if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
+                    log.warn("Failed to read from tcp connection: {}", .{err});
+                }
+                return;
+            };
         }
-        log.debug("Request: \n{s}\n", .{rb.slice[0..len]});
-
-        // TODO: This is where we should parse the header, make sure it is valid.
-        // Check the full lengh and keep polling if more is to come.
-        // Also should check keep alive.
+        log.debug("Request: \n{s}\n", .{buffer[0..read_len]});
 
         const response =
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 13\r\n\r\nHello, World!";
-        const slice = std.fmt.bufPrint(&self.?.buffer, response, .{}) catch |err| {
-            log.warn("Failed to write to io buffer: {}", .{err});
-            self.?.close(loop, socket);
-            return .disarm;
-        };
-        socket.write(loop, &self.?.completion, .{ .slice = slice }, Self, self, Self.write_callback);
-        return .disarm;
-    }
 
-    fn write_callback(
-        self: ?*Self,
-        loop: *xev.Loop,
-        _: *xev.Completion,
-        socket: xev.TCP,
-        wb: xev.WriteBuffer,
-        len_result: xev.WriteError!usize,
-    ) xev.CallbackAction {
-        var d: [21]u64 = undefined;
-        coro.switch_context(&d, &d);
-        const len = len_result catch |err| {
-            // I'm not sure this is correct, but I think we need to retry on would block.
-            // Feels like something that libxev should handle on its own.
-            if (err == error.WouldBlock) {
+        var write_len: usize = 0;
+        // TODO: handle partial reads.
+        // For now just re-read on any empty reads.
+        while (write_len == 0) {
+            const result = socket_write(socket, response);
+            write_len = result catch |err| {
+                if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
+                    log.warn("Failed to write to tcp connection: {}", .{err});
+                }
+                return;
+            };
+        }
+    }
+}
+
+fn socket_read(socket: xev.TCP, buffer: []u8) xev.ReadError!usize {
+    const ReadState = struct {
+        coroutine: *Coroutine,
+        result: xev.ReadError!usize,
+    };
+    var read_state = ReadState{
+        .coroutine = coro.current_coroutine.?,
+        .result = undefined,
+    };
+
+    var completion: xev.Completion = undefined;
+    coro.current_coroutine.?.state = .awaiting_io;
+    poller.lock.lock();
+    socket.read(&poller.loop, &completion, .{ .slice = buffer }, ReadState, &read_state, struct {
+        fn callback(
+            state: ?*ReadState,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            _: xev.TCP,
+            _: xev.ReadBuffer,
+            result: xev.ReadError!usize,
+        ) xev.CallbackAction {
+            if (result == error.WouldBlock) {
                 return .rearm;
             }
-            if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
-                log.warn("Failed to write to tcp connection: {}", .{err});
-            }
-            self.?.close(loop, socket);
+            const c = state.?.*.coroutine;
+            c.state = .active;
+            state.?.*.result = result;
+            scheduler.lock.lock();
+            scheduler.queue.push(c) catch unreachable;
+            scheduler.lock.unlock();
             return .disarm;
-        };
-        // TODO: handle partial writes.
-        // I'm a bit suprised that writing 0 bytes doesn't count as would block.
-        if (len == 0) {
-            return .rearm;
         }
-        log.debug("Response: \n{s}\n", .{wb.slice[0..len]});
+    }.callback);
+    poller.lock.unlock();
+    coro.switch_context(&coro.main_coroutine);
+    log.debug("Loaded coroutine on thread: {}", .{thread_id});
+    return read_state.result;
+}
 
-        // Send back to reading. Just assuming keep alive for now.
-        socket.read(loop, &self.?.completion, .{ .slice = &self.?.buffer }, Self, self, Self.read_callback);
-        return .disarm;
-    }
+fn socket_write(socket: xev.TCP, buffer: []const u8) xev.WriteError!usize {
+    const WriteState = struct {
+        coroutine: *Coroutine,
+        result: xev.WriteError!usize,
+    };
+    var write_state = WriteState{
+        .coroutine = coro.current_coroutine.?,
+        .result = undefined,
+    };
 
-    fn close(self: *Self, loop: *xev.Loop, socket: xev.TCP) void {
-        socket.close(loop, &self.completion, Self, self, close_callback);
-    }
+    var completion: xev.Completion = undefined;
+    coro.current_coroutine.?.state = .awaiting_io;
+    poller.lock.lock();
+    socket.write(&poller.loop, &completion, .{ .slice = buffer }, WriteState, &write_state, struct {
+        fn callback(
+            state: ?*WriteState,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            _: xev.TCP,
+            _: xev.WriteBuffer,
+            result: xev.WriteError!usize,
+        ) xev.CallbackAction {
+            if (result == error.WouldBlock) {
+                return .rearm;
+            }
+            const c = state.?.*.coroutine;
+            c.state = .active;
+            state.?.*.result = result;
+            scheduler.lock.lock();
+            scheduler.queue.push(c) catch unreachable;
+            scheduler.lock.unlock();
+            return .disarm;
+        }
+    }.callback);
+    poller.lock.unlock();
+    coro.switch_context(&coro.main_coroutine);
+    log.debug("Loaded coroutine on thread: {}", .{thread_id});
+    return write_state.result;
+}
 
-    fn close_callback(
-        self: ?*Self,
-        _: *xev.Loop,
-        _: *xev.Completion,
-        _: xev.TCP,
-        _: xev.ShutdownError!void,
-    ) xev.CallbackAction {
-        var d: [21]u64 = undefined;
-        coro.switch_context(&d, &d);
-        // If shutdowns fails, should this retry?
-        allocator.destroy(self.?);
-        return .disarm;
-    }
-};
+fn socket_close(socket: xev.TCP) void {
+    var completion: xev.Completion = undefined;
+    coro.current_coroutine.?.state = .awaiting_io;
+    poller.lock.lock();
+    socket.close(&poller.loop, &completion, coro.Coroutine, coro.current_coroutine, struct {
+        fn callback(
+            c: ?*coro.Coroutine,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            _: xev.TCP,
+            _: xev.ShutdownError!void,
+        ) xev.CallbackAction {
+            scheduler.lock.lock();
+            scheduler.queue.push(c.?) catch unreachable;
+            scheduler.lock.unlock();
+            return .disarm;
+        }
+    }.callback);
+    poller.lock.unlock();
+    coro.switch_context(&coro.main_coroutine);
+    log.debug("Loaded coroutine on thread: {}", .{thread_id});
+}

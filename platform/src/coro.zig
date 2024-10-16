@@ -38,17 +38,18 @@ pub fn switch_context(target: *Coroutine) void {
 const STACK_SIZE = 1024 * 1024; // 1MB stack.
 const STACK_ALIGN = 16;
 
-threadlocal var main_coroutine: Coroutine = .{
+pub threadlocal var main_coroutine: Coroutine = .{
     .context = std.mem.zeroes([context_size]usize),
     .func = undefined,
     .arg = undefined,
     .mmap = undefined,
     .state = .active,
 };
-threadlocal var current_coroutine: ?*Coroutine = null;
+pub threadlocal var current_coroutine: ?*Coroutine = null;
 
 pub const State = enum {
     active,
+    awaiting_io,
     done,
 };
 pub const Coroutine = struct {
