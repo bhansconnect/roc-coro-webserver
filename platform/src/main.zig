@@ -7,7 +7,7 @@ const Coroutine = coro.Coroutine;
 
 const log = std.log.scoped(.platform);
 pub const std_options: std.Options = .{
-    .log_level = .debug,
+    .log_level = .info,
 };
 
 var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
@@ -136,7 +136,6 @@ fn handle_tcp_requests(socket: xev.TCP) void {
                 break :outer;
             };
         }
-        log.debug("Request: \n{s}\n", .{buffer[0..read_len]});
 
         const response =
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 13\r\n\r\nHello, World!";
@@ -154,7 +153,7 @@ fn handle_tcp_requests(socket: xev.TCP) void {
             };
         }
     }
-    // socket_close(socket);
+    socket_close(socket);
 }
 
 fn socket_read(socket: xev.TCP, buffer: []u8) xev.ReadError!usize {
@@ -254,9 +253,8 @@ fn socket_close(socket: xev.TCP) void {
             _: *xev.Loop,
             _: *xev.Completion,
             _: xev.TCP,
-            x: xev.ShutdownError!void,
+            _: xev.ShutdownError!void,
         ) xev.CallbackAction {
-            log.info("Closed socked??? {}", .{x});
             c.?.state = .active;
             scheduler.lock.lock();
             scheduler.queue.push(c.?) catch unreachable;
