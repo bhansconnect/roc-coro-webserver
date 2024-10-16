@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const log = std.log.scoped(.platform);
 
 const Allocator = std.mem.Allocator;
 
@@ -94,6 +95,9 @@ pub const Coroutine = struct {
         c.func = struct {
             fn func_wrapper(ptr: *void) void {
                 func(@as(*Arg, @alignCast(@ptrCast(ptr))).*);
+                current_coroutine.?.state = .done;
+                log.debug("Coroutine complete", .{});
+                switch_context(&main_coroutine);
             }
         }.func_wrapper;
         c.mmap = mmap;

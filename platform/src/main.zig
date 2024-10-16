@@ -107,8 +107,8 @@ fn run_coroutines(i: usize) !void {
                 scheduler.lock.unlock();
             },
             .awaiting_io => {
-                // Nothing to do.
-                // Coroutine will have put itself in the poller.
+                // TODO: the full locking, unlocking, and completion submitting.
+                poller.lock.unlock();
             },
             .done => {
                 c.deinit();
@@ -119,12 +119,11 @@ fn run_coroutines(i: usize) !void {
 
 fn handle_tcp_requests(socket: xev.TCP) void {
     log.debug("Launched coroutine on thread: {}", .{thread_id});
-    defer socket_close(socket);
 
     var buffer: [4096]u8 = undefined;
 
     // We technically should be checking keepalive, but for now, just loop.
-    while (true) {
+    outer: while (true) {
         var read_len: usize = 0;
         // TODO: handle partial reads.
         // For now just re-read on any empty reads.
@@ -134,7 +133,7 @@ fn handle_tcp_requests(socket: xev.TCP) void {
                 if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
                     log.warn("Failed to read from tcp connection: {}", .{err});
                 }
-                return;
+                break :outer;
             };
         }
         log.debug("Request: \n{s}\n", .{buffer[0..read_len]});
@@ -151,10 +150,11 @@ fn handle_tcp_requests(socket: xev.TCP) void {
                 if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
                     log.warn("Failed to write to tcp connection: {}", .{err});
                 }
-                return;
+                break :outer;
             };
         }
     }
+    // socket_close(socket);
 }
 
 fn socket_read(socket: xev.TCP, buffer: []u8) xev.ReadError!usize {
@@ -168,6 +168,9 @@ fn socket_read(socket: xev.TCP, buffer: []u8) xev.ReadError!usize {
     };
 
     var completion: xev.Completion = undefined;
+    // TODO: we should not actually lock the pooler in a child coroutine.
+    // We should generate a list of completions and share them with the main coroutine.
+    // Then it should update the child coroutine to awaiting io and submit the completions.
     coro.current_coroutine.?.state = .awaiting_io;
     poller.lock.lock();
     socket.read(&poller.loop, &completion, .{ .slice = buffer }, ReadState, &read_state, struct {
@@ -191,9 +194,8 @@ fn socket_read(socket: xev.TCP, buffer: []u8) xev.ReadError!usize {
             return .disarm;
         }
     }.callback);
-    poller.lock.unlock();
     coro.switch_context(&coro.main_coroutine);
-    log.debug("Loaded coroutine on thread: {}", .{thread_id});
+    log.debug("Loaded coroutine after read on thread: {}", .{thread_id});
     return read_state.result;
 }
 
@@ -208,6 +210,9 @@ fn socket_write(socket: xev.TCP, buffer: []const u8) xev.WriteError!usize {
     };
 
     var completion: xev.Completion = undefined;
+    // TODO: we should not actually lock the pooler in a child coroutine.
+    // We should generate a list of completions and share them with the main coroutine.
+    // Then it should update the child coroutine to awaiting io and submit the completions.
     coro.current_coroutine.?.state = .awaiting_io;
     poller.lock.lock();
     socket.write(&poller.loop, &completion, .{ .slice = buffer }, WriteState, &write_state, struct {
@@ -231,14 +236,16 @@ fn socket_write(socket: xev.TCP, buffer: []const u8) xev.WriteError!usize {
             return .disarm;
         }
     }.callback);
-    poller.lock.unlock();
     coro.switch_context(&coro.main_coroutine);
-    log.debug("Loaded coroutine on thread: {}", .{thread_id});
+    log.debug("Loaded coroutine after write on thread: {}", .{thread_id});
     return write_state.result;
 }
 
 fn socket_close(socket: xev.TCP) void {
     var completion: xev.Completion = undefined;
+    // TODO: we should not actually lock the pooler in a child coroutine.
+    // We should generate a list of completions and share them with the main coroutine.
+    // Then it should update the child coroutine to awaiting io and submit the completions.
     coro.current_coroutine.?.state = .awaiting_io;
     poller.lock.lock();
     socket.close(&poller.loop, &completion, coro.Coroutine, coro.current_coroutine, struct {
@@ -247,15 +254,16 @@ fn socket_close(socket: xev.TCP) void {
             _: *xev.Loop,
             _: *xev.Completion,
             _: xev.TCP,
-            _: xev.ShutdownError!void,
+            x: xev.ShutdownError!void,
         ) xev.CallbackAction {
+            log.info("Closed socked??? {}", .{x});
+            c.?.state = .active;
             scheduler.lock.lock();
             scheduler.queue.push(c.?) catch unreachable;
             scheduler.lock.unlock();
             return .disarm;
         }
     }.callback);
-    poller.lock.unlock();
     coro.switch_context(&coro.main_coroutine);
-    log.debug("Loaded coroutine on thread: {}", .{thread_id});
+    log.debug("Loaded coroutine after close on thread: {}", .{thread_id});
 }
