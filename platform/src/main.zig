@@ -68,7 +68,7 @@ pub fn main() !void {
     }).callback);
 
     var threads: [THREAD_COUNT]std.Thread = undefined;
-    for (0..4) |i| {
+    for (0..THREAD_COUNT) |i| {
         threads[i] = try std.Thread.spawn(.{}, run_coroutines, .{i});
     }
     for (threads) |t| {
@@ -171,7 +171,7 @@ fn run_coroutines(i: usize) !void {
                 // Ensure the tasks are actually submitted.
                 // Want to get the io running as fast as possible.
                 defer poller.add_lock.unlock();
-                try poller.loop.submit();
+                // try poller.loop.submit();
             },
             .done => {
                 next_coroutine.?.deinit();
