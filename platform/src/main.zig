@@ -108,8 +108,10 @@ fn run_coroutines(i: usize) !void {
                 break;
             } else |_| {}
             // If out of work, try polling.
-            if (poller.lock.tryLock()) {
-                defer poller.lock.unlock();
+            if (poller.run_lock.tryLock()) {
+                defer poller.run_lock.unlock();
+                poller.add_lock.lock();
+                defer poller.add_lock.unlock();
                 try poller.loop.run(.no_wait);
                 var to_queue = poller.readyCoroutines.items;
                 if (to_queue.len > 0) {
@@ -166,7 +168,10 @@ fn run_coroutines(i: usize) !void {
             },
             .awaiting_io => {
                 // TODO: the full locking, unlocking, and completion submitting.
-                poller.lock.unlock();
+                // Ensure the tasks are actually submitted.
+                // Want to get the io running as fast as possible.
+                defer poller.add_lock.unlock();
+                try poller.loop.submit();
             },
             .done => {
                 next_coroutine.?.deinit();
@@ -188,9 +193,9 @@ fn handle_tcp_requests(socket: xev.TCP) void {
         while (read_len == 0) {
             const result = socket_read(socket, &buffer);
             read_len = result catch |err| {
-                if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
-                    log.warn("Failed to read from tcp connection: {}", .{err});
-                }
+                // if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
+                log.warn("Failed to read from tcp connection: {}", .{err});
+                // }
                 break :outer;
             };
         }
@@ -204,9 +209,9 @@ fn handle_tcp_requests(socket: xev.TCP) void {
         while (write_len == 0) {
             const result = socket_write(socket, response);
             write_len = result catch |err| {
-                if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
-                    log.warn("Failed to write to tcp connection: {}", .{err});
-                }
+                // if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
+                log.warn("Failed to write to tcp connection: {}", .{err});
+                // }
                 break :outer;
             };
         }
@@ -229,7 +234,7 @@ fn socket_read(socket: xev.TCP, buffer: []u8) xev.ReadError!usize {
     // We should generate a list of completions and share them with the main coroutine.
     // Then it should update the child coroutine to awaiting io and submit the completions.
     coro.current_coroutine.?.state = .awaiting_io;
-    poller.lock.lock();
+    poller.add_lock.lock();
     socket.read(&poller.loop, &completion, .{ .slice = buffer }, ReadState, &read_state, struct {
         fn callback(
             state: ?*ReadState,
@@ -269,7 +274,7 @@ fn socket_write(socket: xev.TCP, buffer: []const u8) xev.WriteError!usize {
     // We should generate a list of completions and share them with the main coroutine.
     // Then it should update the child coroutine to awaiting io and submit the completions.
     coro.current_coroutine.?.state = .awaiting_io;
-    poller.lock.lock();
+    poller.add_lock.lock();
     socket.write(&poller.loop, &completion, .{ .slice = buffer }, WriteState, &write_state, struct {
         fn callback(
             state: ?*WriteState,
@@ -300,7 +305,7 @@ fn socket_close(socket: xev.TCP) void {
     // We should generate a list of completions and share them with the main coroutine.
     // Then it should update the child coroutine to awaiting io and submit the completions.
     coro.current_coroutine.?.state = .awaiting_io;
-    poller.lock.lock();
+    poller.add_lock.lock();
     socket.close(&poller.loop, &completion, coro.Coroutine, coro.current_coroutine, struct {
         fn callback(
             c: ?*coro.Coroutine,

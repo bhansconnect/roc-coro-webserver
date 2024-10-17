@@ -16,13 +16,15 @@ pub const Poller = struct {
     const Self = @This();
 
     loop: xev.Loop,
-    lock: std.Thread.Mutex,
+    add_lock: std.Thread.Mutex,
+    run_lock: std.Thread.Mutex,
     readyCoroutines: std.ArrayList(*coro.Coroutine),
 
     pub fn init(allocator: Allocator) !Self {
         return .{
             .loop = try xev.Loop.init(.{}),
-            .lock = .{},
+            .add_lock = .{},
+            .run_lock = .{},
             .readyCoroutines = std.ArrayList(*coro.Coroutine).init(allocator),
         };
     }
