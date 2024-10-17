@@ -20,6 +20,10 @@ pub const Scheduler = struct {
         };
     }
 
+    pub fn len(self: *Self) usize {
+        return self.queue.len();
+    }
+
     pub fn push(self: *Self, c: *coro.Coroutine) !void {
         try self.queue.push(c);
     }
@@ -30,6 +34,10 @@ pub const Scheduler = struct {
 
     pub fn pop(self: *Self) !*coro.Coroutine {
         return self.queue.pop();
+    }
+
+    pub fn pop_many(self: *Self, cs: []*coro.Coroutine) !void {
+        try self.queue.pop_many(cs);
     }
 };
 

@@ -39,7 +39,7 @@ pub fn FlatQueue(comptime T: type) type {
             self.head = inc_wrap(self.head, self.data.len);
         }
 
-        pub fn push_many(self: *Self, elems: []T) !void {
+        pub fn push_many(self: *Self, elems: []const T) !void {
             if (self.len() + elems.len >= self.data.len) {
                 const old_len = self.data.len;
                 const new_capacity = calculate_capacity(T, old_len, old_len + elems.len);
@@ -66,6 +66,23 @@ pub fn FlatQueue(comptime T: type) type {
             const elem = self.data[self.tail];
             self.tail = inc_wrap(self.tail, self.data.len);
             return elem;
+        }
+
+        pub fn pop_many(self: *Self, out: []T) !void {
+            if (self.len() < out.len) {
+                return error.NotEnoughElements;
+            }
+            if (self.tail + out.len < self.data.len) {
+                // Can copy all in one go.
+                std.mem.copyForwards(T, out, self.data[self.tail..(self.tail + out.len)]);
+            } else {
+                // Have to copy in two parts.
+                const size = self.data.len - self.tail;
+                std.mem.copyForwards(T, out[0..size], self.data[self.head..]);
+                const rem_size = out.len - size;
+                std.mem.copyForwards(T, out[size..], self.data[0..rem_size]);
+            }
+            self.tail = inc_n_wrap(self.tail, out.len, self.data.len);
         }
     };
 }
@@ -95,6 +112,10 @@ pub fn FixedFlatQueue(comptime T: type) type {
             return (self.tail + offset) - self.head;
         }
 
+        pub fn available(self: *Self) usize {
+            return self.data.len - self.len();
+        }
+
         pub fn push(self: *Self, elem: T) !void {
             if (self.len() == self.data.len) {
                 return error.QueueFull;
@@ -102,6 +123,24 @@ pub fn FixedFlatQueue(comptime T: type) type {
             self.data[self.head] = elem;
             self.head = inc_wrap(self.head, self.data.len);
         }
+
+        pub fn push_many(self: *Self, elems: []T) !void {
+            if (self.len() + elems.len >= self.data.len) {
+                return error.QueueFull;
+            }
+            if (self.head + elems.len < self.data.len) {
+                // Can copy all in one go.
+                std.mem.copyForwards(T, self.data[self.head..(self.head + elems.len)], elems);
+            } else {
+                // Have to copy in two parts.
+                const size = self.data.len - self.head;
+                std.mem.copyForwards(T, self.data[self.head..], elems[0..size]);
+                const rem_size = elems.len - size;
+                std.mem.copyForwards(T, self.data[0..rem_size], elems[size..]);
+            }
+            self.head = inc_n_wrap(self.head, elems.len, self.data.len);
+        }
+
         pub fn pop(self: *Self) !T {
             if (self.len() == 0) {
                 return error.QueueEmpty;
@@ -109,6 +148,23 @@ pub fn FixedFlatQueue(comptime T: type) type {
             const elem = self.data[self.tail];
             self.tail = inc_wrap(self.tail, self.data.len);
             return elem;
+        }
+
+        pub fn pop_many(self: *Self, out: []T) !void {
+            if (self.len() < out.len) {
+                return error.NotEnoughElements;
+            }
+            if (self.tail + out.len < self.data.len) {
+                // Can copy all in one go.
+                std.mem.copyForwards(T, out, self.data[self.tail..(self.tail + out.len)]);
+            } else {
+                // Have to copy in two parts.
+                const size = self.data.len - self.tail;
+                std.mem.copyForwards(T, out[0..size], self.data[self.head..]);
+                const rem_size = out.len - size;
+                std.mem.copyForwards(T, out[size..], self.data[0..rem_size]);
+            }
+            self.tail = inc_n_wrap(self.tail, out.len, self.data.len);
         }
     };
 }

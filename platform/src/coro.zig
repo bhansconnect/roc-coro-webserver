@@ -34,14 +34,14 @@ const context_size =
     else => @compileError("Unsupported cpu architecture"),
 };
 
-pub fn switch_context(target: *Coroutine) void {
+pub fn switch_context(target: ?*Coroutine) void {
     if (current_coroutine) |current| {
-        current_coroutine = target;
-        switch_context_impl(&current.context, &target.context);
+        current_coroutine = target.?;
+        switch_context_impl(&current.context, &target.?.context);
     } else {
         // We are in main currently.
-        current_coroutine = target;
-        switch_context_impl(&main_coroutine.context, &target.context);
+        current_coroutine = target.?;
+        switch_context_impl(&main_coroutine.context, &target.?.context);
     }
 }
 

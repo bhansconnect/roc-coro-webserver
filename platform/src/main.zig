@@ -1,6 +1,7 @@
 const std = @import("std");
 const xev = @import("xev");
 const coro = @import("coro.zig");
+const queue = @import("queue.zig");
 
 const Allocator = std.mem.Allocator;
 const Coroutine = coro.Coroutine;
@@ -17,6 +18,8 @@ const Poller = @import("poller.zig").Poller;
 var poller = &@import("poller.zig").poller;
 const Scheduler = @import("scheduler.zig").Scheduler;
 var scheduler = &@import("scheduler.zig").scheduler;
+
+const THREAD_COUNT = 4;
 
 pub fn main() !void {
     poller.* = try Poller.init(allocator);
@@ -54,33 +57,22 @@ pub fn main() !void {
                 log.err("Failed to create coroutine: {}", .{err});
                 return .rearm;
             };
-            // To keep things simple for now, just dump directly to the global queue.
-            scheduler.lock.lock();
-            scheduler.queue.push(c) catch unreachable;
-            scheduler.lock.unlock();
 
-            // poller.readyCoroutines.append(c) catch |err| {
-            //     log.err("Failed to queue coroutine: {}", .{err});
-            //     c.deinit();
-            //     return .rearm;
-            // };
-            // var handler = allocator.create(Handler) catch unreachable;
-            // socket.read(&poller.loop, &handler.completion, .{ .slice = &handler.buffer }, Handler, handler, Handler.read_callback);
+            poller.readyCoroutines.append(c) catch |err| {
+                log.err("Failed to queue coroutine: {}", .{err});
+                c.deinit();
+                return .rearm;
+            };
             return .rearm;
         }
     }).callback);
 
+    var threads: [THREAD_COUNT]std.Thread = undefined;
     for (0..4) |i| {
-        _ = try std.Thread.spawn(.{}, run_coroutines, .{i});
+        threads[i] = try std.Thread.spawn(.{}, run_coroutines, .{i});
     }
-
-    // For now, just running the poller in its own thread for simplicity.
-    while (true) {
-        // Sleep for 100 microseconds to avoid bashing the poller lock.
-        std.posix.nanosleep(0, 100 * 1000);
-        poller.lock.lock();
-        try poller.loop.run(.no_wait);
-        poller.lock.unlock();
+    for (threads) |t| {
+        t.join();
     }
 }
 
@@ -89,29 +81,95 @@ threadlocal var thread_id: usize = undefined;
 fn run_coroutines(i: usize) !void {
     thread_id = i;
     log.info("Launching executor thread: {}", .{thread_id});
-    while (true) {
-        scheduler.lock.lock();
-        const c = scheduler.pop() catch {
-            scheduler.lock.unlock();
-            // Sleep for 100 microseconds to avoid bashing the scheduler lock.
-            std.posix.nanosleep(0, 100 * 1000);
-            continue;
-        };
-        scheduler.lock.unlock();
 
-        coro.switch_context(c);
-        switch (c.state) {
-            .active => {
+    const queue_size = 256;
+    var copy_buf: [queue_size]*Coroutine = undefined;
+    var local_queue_buf: [queue_size]*Coroutine = undefined;
+    var local_queue = queue.FixedFlatQueue(*Coroutine).init(&local_queue_buf);
+
+    var tick: u8 = 0;
+    while (true) {
+        var next_coroutine: ?*Coroutine = null;
+        while (next_coroutine == null) : (tick +%= 1) {
+            // It has been a while, try to take one from the global scheduler.
+            // This ensures nothing is left for too long in the global queue.
+            if (tick % 61 == 0) {
                 scheduler.lock.lock();
-                try scheduler.push(c);
+                const result = scheduler.pop();
                 scheduler.lock.unlock();
+                if (result) |c| {
+                    next_coroutine = c;
+                    break;
+                } else |_| {}
+            }
+            // By default just loop the local queue.
+            if (local_queue.pop()) |c| {
+                next_coroutine = c;
+                break;
+            } else |_| {}
+            // If out of work, try polling.
+            if (poller.lock.tryLock()) {
+                defer poller.lock.unlock();
+                try poller.loop.run(.no_wait);
+                var to_queue = poller.readyCoroutines.items;
+                if (to_queue.len > 0) {
+                    next_coroutine = to_queue[0];
+                    to_queue = to_queue[1..];
+                    const local_count = @min(to_queue.len, local_queue.available());
+                    try local_queue.push_many(to_queue[0..local_count]);
+                    to_queue = to_queue[local_count..];
+                    if (to_queue.len > 0) {
+                        scheduler.lock.lock();
+                        defer scheduler.lock.unlock();
+                        try scheduler.push_many(to_queue);
+                    }
+                    poller.readyCoroutines.clearRetainingCapacity();
+                    break;
+                }
+            }
+
+            // Last resort, grab a bunch from the global queue.
+            scheduler.lock.lock();
+            const len = scheduler.len();
+            if (len > 0) {
+                const wanted = @min(@max(len / THREAD_COUNT, 1), local_queue.available());
+                scheduler.pop_many(copy_buf[0..wanted]) catch unreachable;
+                scheduler.lock.unlock();
+
+                next_coroutine = copy_buf[0];
+                local_queue.push_many(copy_buf[1..wanted]) catch unreachable;
+                break;
+            }
+            scheduler.lock.unlock();
+
+            // Literally nothing to do. Take a rest.
+            // 1ms is arbitrary.
+            std.posix.nanosleep(0, 1000 * 1000);
+        }
+        coro.switch_context(next_coroutine.?);
+        switch (next_coroutine.?.state) {
+            .active => {
+                local_queue.push(next_coroutine.?) catch {
+                    // Local queue is full. Push half to global.
+                    // First load all to buffer.
+                    local_queue.pop_many(&copy_buf) catch unreachable;
+
+                    // Keep the first half that should execute sooner.
+                    local_queue.push_many(copy_buf[0..(queue_size / 2)]) catch unreachable;
+
+                    // Submit the rest to the global scheduler.
+                    scheduler.lock.lock();
+                    try scheduler.push_many(copy_buf[(queue_size / 2)..]);
+                    try scheduler.push(next_coroutine.?);
+                    scheduler.lock.unlock();
+                };
             },
             .awaiting_io => {
                 // TODO: the full locking, unlocking, and completion submitting.
                 poller.lock.unlock();
             },
             .done => {
-                c.deinit();
+                next_coroutine.?.deinit();
             },
         }
     }
@@ -187,9 +245,7 @@ fn socket_read(socket: xev.TCP, buffer: []u8) xev.ReadError!usize {
             const c = state.?.*.coroutine;
             c.state = .active;
             state.?.*.result = result;
-            scheduler.lock.lock();
-            scheduler.queue.push(c) catch unreachable;
-            scheduler.lock.unlock();
+            poller.readyCoroutines.append(c) catch unreachable;
             return .disarm;
         }
     }.callback);
@@ -229,9 +285,7 @@ fn socket_write(socket: xev.TCP, buffer: []const u8) xev.WriteError!usize {
             const c = state.?.*.coroutine;
             c.state = .active;
             state.?.*.result = result;
-            scheduler.lock.lock();
-            scheduler.queue.push(c) catch unreachable;
-            scheduler.lock.unlock();
+            poller.readyCoroutines.append(c) catch unreachable;
             return .disarm;
         }
     }.callback);
@@ -256,9 +310,7 @@ fn socket_close(socket: xev.TCP) void {
             _: xev.ShutdownError!void,
         ) xev.CallbackAction {
             c.?.state = .active;
-            scheduler.lock.lock();
-            scheduler.queue.push(c.?) catch unreachable;
-            scheduler.lock.unlock();
+            poller.readyCoroutines.append(c.?) catch unreachable;
             return .disarm;
         }
     }.callback);
