@@ -69,12 +69,28 @@ pub fn main() !void {
 
     var threads: [THREAD_COUNT]std.Thread = undefined;
     for (0..THREAD_COUNT) |i| {
+        thread_queues[i] = queue.FixedFlatQueue(*Coroutine).init(&thread_queue_bufs[i]);
         threads[i] = try std.Thread.spawn(.{}, run_coroutines, .{i});
     }
+    var queue_lengths = std.mem.zeroes([THREAD_COUNT + 1]usize);
+    while (true) {
+        std.posix.nanosleep(1, 0);
+        queue_lengths[0] = scheduler.len();
+
+        for (0..THREAD_COUNT) |i| {
+            queue_lengths[i + 1] = thread_queues[i].len();
+        }
+        log.info("queue_lengths: {any}", .{queue_lengths});
+    }
+
     for (threads) |t| {
         t.join();
     }
 }
+
+const thread_queue_size = 256;
+var thread_queue_bufs: [THREAD_COUNT][thread_queue_size]*Coroutine = undefined;
+var thread_queues: [THREAD_COUNT]queue.FixedFlatQueue(*Coroutine) = undefined;
 
 threadlocal var thread_id: usize = undefined;
 
@@ -82,10 +98,8 @@ fn run_coroutines(i: usize) !void {
     thread_id = i;
     log.info("Launching executor thread: {}", .{thread_id});
 
-    const queue_size = 256;
-    var copy_buf: [queue_size]*Coroutine = undefined;
-    var local_queue_buf: [queue_size]*Coroutine = undefined;
-    var local_queue = queue.FixedFlatQueue(*Coroutine).init(&local_queue_buf);
+    var copy_buf: [thread_queue_size]*Coroutine = undefined;
+    var local_queue = &thread_queues[i];
 
     var tick: u8 = 0;
     while (true) {
@@ -157,11 +171,11 @@ fn run_coroutines(i: usize) !void {
                     local_queue.pop_many(&copy_buf) catch unreachable;
 
                     // Keep the first half that should execute sooner.
-                    local_queue.push_many(copy_buf[0..(queue_size / 2)]) catch unreachable;
+                    local_queue.push_many(copy_buf[0..(thread_queue_size / 2)]) catch unreachable;
 
                     // Submit the rest to the global scheduler.
                     scheduler.lock.lock();
-                    try scheduler.push_many(copy_buf[(queue_size / 2)..]);
+                    try scheduler.push_many(copy_buf[(thread_queue_size / 2)..]);
                     try scheduler.push(next_coroutine.?);
                     scheduler.lock.unlock();
                 };
