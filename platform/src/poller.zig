@@ -10,8 +10,6 @@ const coro = @import("coro.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub var poller: Poller = undefined;
-
 pub const Poller = struct {
     const Self = @This();
 
