@@ -24,8 +24,7 @@
     // internet connectivity.
     .dependencies = .{
         .libxev = .{
-            .url = "git+https://github.com/mitchellh/libxev.git#b8d1d93e5c899b27abbaa7df23b496c3e6a178c7",
-            .hash = "1220612bc023c21d75234882ec9a8c6a1cbd9d642da3dfb899297f14bb5bd7b6cd78",
+            .path = "vendor/libxev",
         },
     },
     .paths = .{
