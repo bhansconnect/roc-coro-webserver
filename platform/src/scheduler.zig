@@ -171,21 +171,29 @@ const Executor = struct {
             coro.switch_context(next_coroutine.?);
             switch (next_coroutine.?.state) {
                 .active => {
-                    self.push(next_coroutine.?) catch {
-                        // Local queue is full. Push half to global.
-                        // First load all to buffer.
-                        self.pop_many(self.copy_buf) catch unreachable;
+                    while (true) {
+                        self.push(next_coroutine.?) catch {
+                            // Local queue is full. Push half to global.
+                            // First load all to buffer.
+                            self.pop_many(self.copy_buf) catch {
+                                // Failed to pop the items.
+                                // Another thread must have stolen the work.
+                                // Just push try again.
+                                continue;
+                            };
 
-                        const thread_queue_size = self.data.len;
-                        // Keep the first half that should execute sooner.
-                        self.push_many(self.copy_buf[0..(thread_queue_size / 2)]) catch unreachable;
+                            const thread_queue_size = self.data.len;
+                            // Keep the first half that should execute sooner.
+                            self.push_many(self.copy_buf[0..(thread_queue_size / 2)]) catch unreachable;
 
-                        // Submit the rest to the global scheduler.
-                        sched.lock.lock();
-                        try sched.push_many(self.copy_buf[(thread_queue_size / 2)..]);
-                        try sched.push(next_coroutine.?);
-                        sched.lock.unlock();
-                    };
+                            // Submit the rest to the global scheduler.
+                            sched.lock.lock();
+                            try sched.push_many(self.copy_buf[(thread_queue_size / 2)..]);
+                            try sched.push(next_coroutine.?);
+                            sched.lock.unlock();
+                            break;
+                        };
+                    }
                 },
                 .awaiting_io => {
                     // TODO: the full locking, unlocking, and completion submitting.
@@ -211,56 +219,96 @@ const Executor = struct {
     }
 
     fn push(self: *Self, elem: *Coroutine) !void {
-        if (self.len() == self.data.len) {
-            return error.QueueFull;
+        std.debug.assert(self.index == executor_index);
+        var h = @atomicLoad(usize, &self.head, .acquire);
+        while (true) {
+            const t = self.tail;
+            if (queue_len(h, t, self.data.len) == self.data.len) {
+                return error.QueueFull;
+            }
+            self.data[self.head] = elem;
+            if (@cmpxchgWeak(usize, &self.head, h, inc_wrap(h, self.data.len), .release, .acquire)) |next| {
+                h = next;
+                continue;
+            }
+            return;
         }
-        self.data[self.head] = elem;
-        self.head = inc_wrap(self.head, self.data.len);
     }
 
     fn push_many(self: *Self, elems: []*Coroutine) !void {
-        if (self.len() + elems.len > self.data.len) {
-            return error.QueueFull;
+        std.debug.assert(self.index == executor_index);
+        var h = @atomicLoad(usize, &self.head, .acquire);
+        while (true) {
+            const t = self.tail;
+            if (queue_len(h, t, self.data.len) + elems.len > self.data.len) {
+                return error.QueueFull;
+            }
+
+            if (h + elems.len <= self.data.len) {
+                // Can copy all in one go.
+                std.mem.copyForwards(*Coroutine, self.data[h..(h + elems.len)], elems);
+            } else {
+                // Have to copy in two parts.
+                const size = self.data.len - h;
+                std.mem.copyForwards(*Coroutine, self.data[h..], elems[0..size]);
+                const rem_size = elems.len - size;
+                std.mem.copyForwards(*Coroutine, self.data[0..rem_size], elems[size..]);
+            }
+
+            if (@cmpxchgWeak(usize, &self.head, h, inc_n_wrap(h, elems.len, self.data.len), .release, .acquire)) |next| {
+                h = next;
+                continue;
+            }
+            return;
         }
-        if (self.head + elems.len < self.data.len) {
-            // Can copy all in one go.
-            std.mem.copyForwards(*Coroutine, self.data[self.head..(self.head + elems.len)], elems);
-        } else {
-            // Have to copy in two parts.
-            const size = self.data.len - self.head;
-            std.mem.copyForwards(*Coroutine, self.data[self.head..], elems[0..size]);
-            const rem_size = elems.len - size;
-            std.mem.copyForwards(*Coroutine, self.data[0..rem_size], elems[size..]);
-        }
-        self.head = inc_n_wrap(self.head, elems.len, self.data.len);
     }
 
     fn pop(self: *Self) !*Coroutine {
-        if (self.len() == 0) {
-            return error.QueueEmpty;
+        var t = @atomicLoad(usize, &self.tail, .acquire);
+        while (true) {
+            const h = self.head;
+            if (h == t) {
+                return error.QueueEmpty;
+            }
+            const elem = self.data[t];
+            if (@cmpxchgWeak(usize, &self.tail, t, inc_wrap(t, self.data.len), .release, .acquire)) |next| {
+                t = next;
+                continue;
+            }
+            return elem;
         }
-        const elem = self.data[self.tail];
-        self.tail = inc_wrap(self.tail, self.data.len);
-        return elem;
     }
 
     fn pop_many(self: *Self, out: []*Coroutine) !void {
-        if (self.len() < out.len) {
-            return error.NotEnoughElements;
+        var t = @atomicLoad(usize, &self.tail, .acquire);
+        while (true) {
+            const h = self.head;
+            if (queue_len(h, t, self.data.len) < out.len) {
+                return error.NotEnoughElements;
+            }
+            if (t + out.len <= self.data.len) {
+                // Can copy all in one go.
+                std.mem.copyForwards(*Coroutine, out, self.data[t..(t + out.len)]);
+            } else {
+                // Have to copy in two parts.
+                const size = self.data.len - t;
+                std.mem.copyForwards(*Coroutine, out[0..size], self.data[t..]);
+                const rem_size = out.len - size;
+                std.mem.copyForwards(*Coroutine, out[size..], self.data[0..rem_size]);
+            }
+            if (@cmpxchgWeak(usize, &self.tail, t, inc_n_wrap(t, out.len, self.data.len), .release, .acquire)) |next| {
+                t = next;
+                continue;
+            }
+            return;
         }
-        if (self.tail + out.len < self.data.len) {
-            // Can copy all in one go.
-            std.mem.copyForwards(*Coroutine, out, self.data[self.tail..(self.tail + out.len)]);
-        } else {
-            // Have to copy in two parts.
-            const size = self.data.len - self.tail;
-            std.mem.copyForwards(*Coroutine, out[0..size], self.data[self.head..]);
-            const rem_size = out.len - size;
-            std.mem.copyForwards(*Coroutine, out[size..], self.data[0..rem_size]);
-        }
-        self.tail = inc_n_wrap(self.tail, out.len, self.data.len);
     }
 };
+
+fn queue_len(h: usize, t: usize, len: usize) usize {
+    const offset = if (h < t) len else 0;
+    return (h + offset) - t;
+}
 
 fn inc_n_wrap(index: usize, n: usize, len: usize) usize {
     std.debug.assert(n <= len);

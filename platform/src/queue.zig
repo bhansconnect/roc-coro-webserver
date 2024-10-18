@@ -46,7 +46,7 @@ pub fn FlatQueue(comptime T: type) type {
                 self.data = try self.allocator.realloc(self.data, new_capacity * @sizeOf(T));
                 self.head += old_len;
             }
-            if (self.head + elems.len < self.data.len) {
+            if (self.head + elems.len <= self.data.len) {
                 // Can copy all in one go.
                 std.mem.copyForwards(T, self.data[self.head..(self.head + elems.len)], elems);
             } else {
@@ -72,13 +72,13 @@ pub fn FlatQueue(comptime T: type) type {
             if (self.len() < out.len) {
                 return error.NotEnoughElements;
             }
-            if (self.tail + out.len < self.data.len) {
+            if (self.tail + out.len <= self.data.len) {
                 // Can copy all in one go.
                 std.mem.copyForwards(T, out, self.data[self.tail..(self.tail + out.len)]);
             } else {
                 // Have to copy in two parts.
                 const size = self.data.len - self.tail;
-                std.mem.copyForwards(T, out[0..size], self.data[self.head..]);
+                std.mem.copyForwards(T, out[0..size], self.data[self.tail..]);
                 const rem_size = out.len - size;
                 std.mem.copyForwards(T, out[size..], self.data[0..rem_size]);
             }
