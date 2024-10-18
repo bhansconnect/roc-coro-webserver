@@ -24,8 +24,8 @@ pub fn FlatQueue(comptime T: type) type {
         }
 
         pub fn len(self: *Self) usize {
-            const offset = if (self.tail < self.head) self.data.len else 0;
-            return (self.tail + offset) - self.head;
+            const offset = if (self.head < self.tail) self.data.len else 0;
+            return (self.head + offset) - self.tail;
         }
 
         pub fn push(self: *Self, elem: T) !void {
@@ -108,8 +108,8 @@ pub fn FixedFlatQueue(comptime T: type) type {
         }
 
         pub fn len(self: *Self) usize {
-            const offset = if (self.tail < self.head) self.data.len else 0;
-            return (self.tail + offset) - self.head;
+            const offset = if (self.head < self.tail) self.data.len else 0;
+            return (self.head + offset) - self.tail;
         }
 
         pub fn available(self: *Self) usize {
