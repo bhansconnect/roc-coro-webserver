@@ -193,9 +193,9 @@ fn handle_tcp_requests(socket: xev.TCP) void {
         while (read_len == 0) {
             const result = socket_read(socket, &buffer);
             read_len = result catch |err| {
-                // if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
-                log.warn("Failed to read from tcp connection: {}", .{err});
-                // }
+                if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
+                    log.warn("Failed to read from tcp connection: {}", .{err});
+                }
                 break :outer;
             };
         }
@@ -209,9 +209,9 @@ fn handle_tcp_requests(socket: xev.TCP) void {
         while (write_len == 0) {
             const result = socket_write(socket, response);
             write_len = result catch |err| {
-                // if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
-                log.warn("Failed to write to tcp connection: {}", .{err});
-                // }
+                if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
+                    log.warn("Failed to write to tcp connection: {}", .{err});
+                }
                 break :outer;
             };
         }
