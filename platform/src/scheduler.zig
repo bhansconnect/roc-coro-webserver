@@ -119,7 +119,24 @@ const Executor = struct {
                     next_coroutine = c;
                     break;
                 } else |_| {}
-                // If out of work, try polling.
+
+                // Nothing local to do, try to grab a batch of waiting global work.
+                // The double check on length avoids locking if the length is zero.
+                if (sched.len() > 0) {
+                    sched.lock.lock();
+                    if (sched.len() > 0) {
+                        const wanted = @min(@max(sched.len() / sched.executors.len, 1), self.available());
+                        sched.pop_many(self.copy_buf[0..wanted]) catch unreachable;
+                        sched.lock.unlock();
+
+                        next_coroutine = self.copy_buf[0];
+                        self.push_many(self.copy_buf[1..wanted]) catch unreachable;
+                        break;
+                    }
+                    sched.lock.unlock();
+                }
+
+                // If out of work, try polling with no delay.
                 if (poller.run_lock.tryLock()) {
                     defer poller.run_lock.unlock();
                     poller.add_lock.lock();
@@ -142,19 +159,10 @@ const Executor = struct {
                     }
                 }
 
-                // Last resort, grab a bunch from the global queue.
-                sched.lock.lock();
-                const length = sched.len();
-                if (length > 0) {
-                    const wanted = @min(@max(length / sched.executors.len, 1), self.available());
-                    sched.pop_many(self.copy_buf[0..wanted]) catch unreachable;
-                    sched.lock.unlock();
+                // TODO: Steal work from other executors.
 
-                    next_coroutine = self.copy_buf[0];
-                    self.push_many(self.copy_buf[1..wanted]) catch unreachable;
-                    break;
-                }
-                sched.lock.unlock();
+                // Might be worth trying netpoller with a delay here.
+                // That is what go does kinda...
 
                 // Literally nothing to do. Take a rest.
                 // 1ms is arbitrary.
