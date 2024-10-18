@@ -104,9 +104,6 @@ pub const Coroutine = struct {
         c.func = struct {
             fn func_wrapper(ptr: *void) void {
                 func(@as(*Arg, @alignCast(@ptrCast(ptr))).*);
-                current_coroutine.?.state = .done;
-                log.debug("Coroutine complete", .{});
-                switch_context(&main_coroutine);
             }
         }.func_wrapper;
         c.mmap = mmap;
@@ -151,6 +148,13 @@ pub const Coroutine = struct {
 fn coroutine_wrapper() void {
     var c = current_coroutine.?;
     c.func(c.arg);
-    c.state = .done;
+    // Exit has to be a separate function.
+    // If I use `&main_coroutine` here, zig will load the address too soon.
+    // As such, we will try to return to the main_coroutine on the wrong thread.
+    exit();
+}
+
+noinline fn exit() void {
+    current_coroutine.?.state = .done;
     switch_context(&main_coroutine);
 }
