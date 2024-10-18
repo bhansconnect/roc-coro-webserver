@@ -10,9 +10,9 @@ pub fn FlatQueue(comptime T: type) type {
         tail: usize,
         allocator: Allocator,
 
-        pub fn init(allocator: Allocator) Self {
+        pub fn init(allocator: Allocator, starting_size: usize) !Self {
             return .{
-                .data = &[0]T{},
+                .data = try allocator.alloc(T, starting_size),
                 .head = 0,
                 .tail = 0,
                 .allocator = allocator,
@@ -23,28 +23,46 @@ pub fn FlatQueue(comptime T: type) type {
             self.data.deinit();
         }
 
+        pub fn cap(self: *Self) usize {
+            return self.data.len - 1;
+        }
+
+        pub fn is_empty(self: *Self) bool {
+            return self.head == self.tail;
+        }
+
         pub fn len(self: *Self) usize {
-            const offset = if (self.head < self.tail) self.data.len else 0;
+            const offset = if (self.head < self.tail) (self.data.len) else 0;
             return (self.head + offset) - self.tail;
         }
 
         pub fn push(self: *Self, elem: T) !void {
-            if (self.len() == self.data.len) {
+            if (self.len() == self.cap()) {
                 const old_len = self.data.len;
                 const new_capacity = calculate_capacity(T, old_len, old_len + 1);
                 self.data = try self.allocator.realloc(self.data, new_capacity * @sizeOf(T));
-                self.head += old_len;
+                // shift elements to keep queue in order
+                if (self.head < self.tail) {
+                    const old_head = self.head;
+                    self.head += old_len;
+                    std.mem.copyForwards(T, self.data[old_len..self.head], self.data[0..old_head]);
+                }
             }
             self.data[self.head] = elem;
             self.head = inc_wrap(self.head, self.data.len);
         }
 
         pub fn push_many(self: *Self, elems: []const T) !void {
-            if (self.len() + elems.len > self.data.len) {
+            if (self.len() + elems.len > self.cap()) {
                 const old_len = self.data.len;
                 const new_capacity = calculate_capacity(T, old_len, old_len + elems.len);
                 self.data = try self.allocator.realloc(self.data, new_capacity * @sizeOf(T));
-                self.head += old_len;
+                // shift elements to keep queue in order
+                if (self.head < self.tail) {
+                    const old_head = self.head;
+                    self.head += old_len;
+                    std.mem.copyForwards(T, self.data[old_len..self.head], self.data[0..old_head]);
+                }
             }
             if (self.head + elems.len <= self.data.len) {
                 // Can copy all in one go.

@@ -16,7 +16,7 @@ pub fn init_global(allocator: Allocator, config: Scheduler.Config) !void {
     }
     global = try allocator.create(Scheduler);
     global.?.lock = .{};
-    global.?.queue = queue.FlatQueue(*Coroutine).init(allocator);
+    global.?.queue = try queue.FlatQueue(*Coroutine).init(allocator, config.executor_config.queue_size);
     global.?.poller = try Poller.init(allocator);
 
     const num_executors = if (config.num_executors == 0) try std.Thread.getCpuCount() else config.num_executors;
@@ -42,6 +42,10 @@ pub const Scheduler = struct {
     queue: queue.FlatQueue(*Coroutine),
     executors: []Executor,
     poller: Poller,
+
+    pub fn is_empty(self: *Self) bool {
+        return self.queue.is_empty();
+    }
 
     pub fn len(self: *Self) usize {
         return self.queue.len();
@@ -122,9 +126,9 @@ const Executor = struct {
 
                 // Nothing local to do, try to grab a batch of waiting global work.
                 // The double check on length avoids locking if the length is zero.
-                if (sched.len() > 0) {
+                if (!sched.is_empty()) {
                     sched.lock.lock();
-                    if (sched.len() > 0) {
+                    if (!sched.is_empty()) {
                         const wanted = @min(@max(sched.len() / sched.executors.len, 1), self.available());
                         sched.pop_many(self.copy_buf[0..wanted]) catch unreachable;
                         sched.lock.unlock();
@@ -209,13 +213,16 @@ const Executor = struct {
         }
     }
 
+    pub fn cap(self: *Self) usize {
+        return self.data.len - 1;
+    }
+
     pub fn len(self: *Self) usize {
-        const offset = if (self.head < self.tail) self.data.len else 0;
-        return (self.head + offset) - self.tail;
+        return queue_len(self.head, self.tail, self.data.len);
     }
 
     fn available(self: *Self) usize {
-        return self.data.len - self.len();
+        return self.cap() - self.len();
     }
 
     fn push(self: *Self, elem: *Coroutine) !void {
@@ -223,7 +230,7 @@ const Executor = struct {
         var h = @atomicLoad(usize, &self.head, .acquire);
         while (true) {
             const t = self.tail;
-            if (queue_len(h, t, self.data.len) == self.data.len) {
+            if (queue_len(h, t, self.data.len) == self.cap()) {
                 return error.QueueFull;
             }
             self.data[self.head] = elem;
@@ -237,10 +244,12 @@ const Executor = struct {
 
     fn push_many(self: *Self, elems: []*Coroutine) !void {
         std.debug.assert(self.index == executor_index);
+        if (elems.len == 0) return;
+
         var h = @atomicLoad(usize, &self.head, .acquire);
         while (true) {
             const t = self.tail;
-            if (queue_len(h, t, self.data.len) + elems.len > self.data.len) {
+            if (queue_len(h, t, self.data.len) + elems.len > self.cap()) {
                 return error.QueueFull;
             }
 
