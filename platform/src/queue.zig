@@ -40,7 +40,7 @@ pub fn FlatQueue(comptime T: type) type {
         }
 
         pub fn push_many(self: *Self, elems: []const T) !void {
-            if (self.len() + elems.len >= self.data.len) {
+            if (self.len() + elems.len > self.data.len) {
                 const old_len = self.data.len;
                 const new_capacity = calculate_capacity(T, old_len, old_len + elems.len);
                 self.data = try self.allocator.realloc(self.data, new_capacity * @sizeOf(T));
@@ -125,7 +125,7 @@ pub fn FixedFlatQueue(comptime T: type) type {
         }
 
         pub fn push_many(self: *Self, elems: []T) !void {
-            if (self.len() + elems.len >= self.data.len) {
+            if (self.len() + elems.len > self.data.len) {
                 return error.QueueFull;
             }
             if (self.head + elems.len < self.data.len) {
@@ -170,12 +170,13 @@ pub fn FixedFlatQueue(comptime T: type) type {
 }
 
 fn inc_n_wrap(index: usize, n: usize, len: usize) usize {
-    std.debug.assert(n < len);
-
+    std.debug.assert(n <= len);
     var i = index;
     i += n;
     const shift = if (i >= len) len else 0;
-    return i - shift;
+    const out = i - shift;
+    std.debug.assert(out < len);
+    return out;
 }
 
 fn inc_wrap(i: usize, len: usize) usize {
