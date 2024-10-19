@@ -67,15 +67,18 @@ pub fn main() !void {
         }
     }).callback);
 
-    var queue_lengths = try allocator.alloc(usize, scheduler.global.?.executors.len + 1);
-    while (true) {
-        std.posix.nanosleep(1, 0);
-        queue_lengths[0] = scheduler.global.?.len();
+    // var queue_lengths = try allocator.alloc(usize, scheduler.global.?.executors.len + 1);
+    // while (true) {
+    //     std.posix.nanosleep(1, 0);
+    //     queue_lengths[0] = scheduler.global.?.len();
 
-        for (0..scheduler.global.?.executors.len) |i| {
-            queue_lengths[i + 1] = scheduler.global.?.executors[i].len();
-        }
-        log.info("queue_lengths: {any}", .{queue_lengths});
+    //     for (0..scheduler.global.?.executors.len) |i| {
+    //         queue_lengths[i + 1] = scheduler.global.?.executors[i].len();
+    //     }
+    //     log.info("queue_lengths: {any}", .{queue_lengths});
+    // }
+    for (scheduler.global.?.executors) |e| {
+        e.thread.?.join();
     }
 }
 
