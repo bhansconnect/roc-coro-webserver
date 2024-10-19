@@ -1,6 +1,6 @@
 const std = @import("std");
+const xev = @import("xev");
 const coro = @import("coro.zig");
-const queue = @import("queue.zig");
 
 const Allocator = std.mem.Allocator;
 const Coroutine = coro.Coroutine;
@@ -16,7 +16,8 @@ pub fn init_global(allocator: Allocator, config: Scheduler.Config) !void {
     }
     global = try allocator.create(Scheduler);
     global.?.lock = .{};
-    global.?.queue = try queue.FlatQueue(*Coroutine).init(allocator, config.executor_config.queue_size);
+    global.?.queue = .{};
+    global.?.length = 0;
     try global.?.poller.init();
 
     const num_executors = if (config.num_executors == 0) try std.Thread.getCpuCount() else config.num_executors;
@@ -39,32 +40,40 @@ pub const Scheduler = struct {
 
     lock: std.Thread.Mutex,
     // Theoretically this could be a lock free queue.
-    queue: queue.FlatQueue(*Coroutine),
+    queue: xev.queue.Intrusive(Coroutine),
+    length: usize,
     executors: []Executor,
     poller: Poller,
 
     pub fn is_empty(self: *Self) bool {
-        return self.queue.is_empty();
+        return self.length == 0;
     }
 
     pub fn len(self: *Self) usize {
-        return self.queue.len();
+        return self.length;
     }
 
-    pub fn push(self: *Self, c: *Coroutine) !void {
-        try self.queue.push(c);
+    pub fn push(self: *Self, c: *Coroutine) void {
+        self.length += 1;
+        self.queue.push(c);
     }
 
-    pub fn push_many(self: *Self, cs: []*Coroutine) !void {
-        try self.queue.push_many(cs);
+    pub fn push_many(self: *Self, cs: []*Coroutine) void {
+        // For push many, there are smart ways to reduce the global scheduler lock.
+        // The main one is the link all of the entries before locking the scheduler.
+        // We should do that.
+        // Then sumbit is updating just two pointers.
+        for (cs) |c| {
+            self.push(c);
+        }
     }
 
-    pub fn pop(self: *Self) !*Coroutine {
-        return self.queue.pop();
-    }
-
-    pub fn pop_many(self: *Self, cs: []*Coroutine) !void {
-        try self.queue.pop_many(cs);
+    pub fn pop(self: *Self) ?*Coroutine {
+        if (self.queue.pop()) |c| {
+            self.length -= 1;
+            return c;
+        }
+        return null;
     }
 };
 
@@ -117,7 +126,7 @@ const Executor = struct {
                     if (result) |c| {
                         next_coroutine = c;
                         break;
-                    } else |_| {}
+                    }
                 }
                 // By default just loop the local queue.
                 if (self.pop()) |c| {
@@ -129,16 +138,17 @@ const Executor = struct {
                 // The double check on length avoids locking if the length is zero.
                 if (!sched.is_empty()) {
                     sched.lock.lock();
+                    defer sched.lock.unlock();
                     if (!sched.is_empty()) {
-                        const wanted = @min(@max(sched.len() / sched.executors.len, 1), self.available());
-                        sched.pop_many(self.copy_buf[0..wanted]) catch unreachable;
-                        sched.lock.unlock();
-
-                        next_coroutine = self.copy_buf[0];
-                        self.push_many(self.copy_buf[1..wanted]) catch unreachable;
+                        var target = sched.len() / sched.executors.len + 1;
+                        target = @min(sched.len(), target);
+                        target = @min(self.cap() / 2, target);
+                        next_coroutine = sched.pop() orelse unreachable;
+                        for (1..target) |_| {
+                            self.push(sched.pop() orelse unreachable) catch unreachable;
+                        }
                         break;
                     }
-                    sched.lock.unlock();
                 }
 
                 // If out of work, try polling with no delay.
@@ -174,7 +184,9 @@ const Executor = struct {
                         if (to_queue.len > 0) {
                             sched.lock.lock();
                             defer sched.lock.unlock();
-                            try sched.push_many(to_queue);
+                            for (to_queue) |c| {
+                                sched.push(c);
+                            }
                         }
                     }
                     if (next_coroutine != null) {
@@ -211,8 +223,10 @@ const Executor = struct {
 
                             // Submit the rest to the global scheduler.
                             sched.lock.lock();
-                            try sched.push_many(self.copy_buf[(thread_queue_size / 2)..]);
-                            try sched.push(next_coroutine.?);
+                            for (self.copy_buf[(thread_queue_size / 2)..]) |c| {
+                                sched.push(c);
+                            }
+                            sched.push(next_coroutine.?);
                             sched.lock.unlock();
                         };
                         break;

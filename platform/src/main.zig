@@ -1,7 +1,6 @@
 const std = @import("std");
 const xev = @import("xev");
 const coro = @import("coro.zig");
-const queue = @import("queue.zig");
 const scheduler = @import("scheduler.zig");
 
 const Allocator = std.mem.Allocator;
