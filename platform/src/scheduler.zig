@@ -17,7 +17,7 @@ pub fn init_global(allocator: Allocator, config: Scheduler.Config) !void {
     global = try allocator.create(Scheduler);
     global.?.lock = .{};
     global.?.queue = try queue.FlatQueue(*Coroutine).init(allocator, config.executor_config.queue_size);
-    global.?.poller = try Poller.init(allocator);
+    try global.?.poller.init();
 
     const num_executors = if (config.num_executors == 0) try std.Thread.getCpuCount() else config.num_executors;
     global.?.executors = try allocator.alloc(Executor, num_executors);
@@ -83,6 +83,7 @@ const Executor = struct {
     thread: ?std.Thread = null,
     copy_buf: []*Coroutine,
     data: []*Coroutine,
+    // In this queue, you push to tail and pop from head.
     head: usize,
     tail: usize,
     index: usize,
@@ -143,13 +144,30 @@ const Executor = struct {
                 // If out of work, try polling with no delay.
                 if (poller.run_lock.tryLock()) {
                     defer poller.run_lock.unlock();
-                    poller.add_lock.lock();
-                    defer poller.add_lock.unlock();
+                    // TODO: we should add some time aspect to this.
+                    // If things are not submitted often enough, a sysmon thread should run through this.
+                    // Submit all of the awaiting work.
+                    // TODO: Should there be a max number of submissions here?
+                    // Theoretically this could be stuck forever as work is being queued in other threads.
+                    while (poller.submission_queue.pop()) |c| {
+                        poller.loop.add(c);
+                    }
                     try poller.loop.run(.no_wait);
-                    var to_queue = poller.readyCoroutines.items;
-                    if (to_queue.len > 0) {
-                        next_coroutine = to_queue[0];
-                        to_queue = to_queue[1..];
+                    // First task is what we will work on next.
+                    if (poller.ready_coroutines.pop()) |c| {
+                        next_coroutine = c;
+                    }
+                    // Remaining tasks are put in queues.
+                    while (!poller.ready_coroutines.empty()) {
+                        var index: usize = 0;
+                        while (poller.ready_coroutines.pop()) |c| {
+                            self.copy_buf[index] = c;
+                            index += 1;
+                            if (index == self.copy_buf.len) {
+                                break;
+                            }
+                        }
+                        var to_queue = self.copy_buf[0..index];
                         const local_count = @min(to_queue.len, self.available());
                         try self.push_many(to_queue[0..local_count]);
                         to_queue = to_queue[local_count..];
@@ -158,7 +176,8 @@ const Executor = struct {
                             defer sched.lock.unlock();
                             try sched.push_many(to_queue);
                         }
-                        poller.readyCoroutines.clearRetainingCapacity();
+                    }
+                    if (next_coroutine != null) {
                         break;
                     }
                 }
@@ -195,17 +214,11 @@ const Executor = struct {
                             try sched.push_many(self.copy_buf[(thread_queue_size / 2)..]);
                             try sched.push(next_coroutine.?);
                             sched.lock.unlock();
-                            break;
                         };
+                        break;
                     }
                 },
-                .awaiting_io => {
-                    // TODO: the full locking, unlocking, and completion submitting.
-                    // Ensure the tasks are actually submitted.
-                    // Want to get the io running as fast as possible.
-                    defer poller.add_lock.unlock();
-                    // try poller.loop.submit();
-                },
+                .awaiting_io => {},
                 .done => {
                     next_coroutine.?.deinit();
                 },
@@ -227,15 +240,15 @@ const Executor = struct {
 
     fn push(self: *Self, elem: *Coroutine) !void {
         std.debug.assert(self.index == executor_index);
-        var h = @atomicLoad(usize, &self.head, .acquire);
+        var t = @atomicLoad(usize, &self.tail, .acquire);
         while (true) {
-            const t = self.tail;
+            const h = self.head;
             if (queue_len(h, t, self.data.len) == self.cap()) {
                 return error.QueueFull;
             }
-            self.data[self.head] = elem;
-            if (@cmpxchgWeak(usize, &self.head, h, inc_wrap(h, self.data.len), .release, .acquire)) |next| {
-                h = next;
+            self.data[t] = elem;
+            if (@cmpxchgWeak(usize, &self.tail, t, inc_wrap(t, self.data.len), .release, .acquire)) |next| {
+                t = next;
                 continue;
             }
             return;
@@ -246,26 +259,26 @@ const Executor = struct {
         std.debug.assert(self.index == executor_index);
         if (elems.len == 0) return;
 
-        var h = @atomicLoad(usize, &self.head, .acquire);
+        var t = @atomicLoad(usize, &self.tail, .acquire);
         while (true) {
-            const t = self.tail;
+            const h = self.head;
             if (queue_len(h, t, self.data.len) + elems.len > self.cap()) {
                 return error.QueueFull;
             }
 
-            if (h + elems.len <= self.data.len) {
+            if (t + elems.len <= self.data.len) {
                 // Can copy all in one go.
-                std.mem.copyForwards(*Coroutine, self.data[h..(h + elems.len)], elems);
+                std.mem.copyForwards(*Coroutine, self.data[t..(t + elems.len)], elems);
             } else {
                 // Have to copy in two parts.
-                const size = self.data.len - h;
-                std.mem.copyForwards(*Coroutine, self.data[h..], elems[0..size]);
+                const size = self.data.len - t;
+                std.mem.copyForwards(*Coroutine, self.data[t..], elems[0..size]);
                 const rem_size = elems.len - size;
                 std.mem.copyForwards(*Coroutine, self.data[0..rem_size], elems[size..]);
             }
 
-            if (@cmpxchgWeak(usize, &self.head, h, inc_n_wrap(h, elems.len, self.data.len), .release, .acquire)) |next| {
-                h = next;
+            if (@cmpxchgWeak(usize, &self.tail, t, inc_n_wrap(t, elems.len, self.data.len), .release, .acquire)) |next| {
+                t = next;
                 continue;
             }
             return;
@@ -273,15 +286,15 @@ const Executor = struct {
     }
 
     fn pop(self: *Self) !*Coroutine {
-        var t = @atomicLoad(usize, &self.tail, .acquire);
+        var h = @atomicLoad(usize, &self.head, .acquire);
         while (true) {
-            const h = self.head;
-            if (h == t) {
+            const t = self.tail;
+            if (t == h) {
                 return error.QueueEmpty;
             }
-            const elem = self.data[t];
-            if (@cmpxchgWeak(usize, &self.tail, t, inc_wrap(t, self.data.len), .release, .acquire)) |next| {
-                t = next;
+            const elem = self.data[h];
+            if (@cmpxchgWeak(usize, &self.head, h, inc_wrap(h, self.data.len), .release, .acquire)) |next| {
+                h = next;
                 continue;
             }
             return elem;
@@ -289,24 +302,24 @@ const Executor = struct {
     }
 
     fn pop_many(self: *Self, out: []*Coroutine) !void {
-        var t = @atomicLoad(usize, &self.tail, .acquire);
+        var h = @atomicLoad(usize, &self.head, .acquire);
         while (true) {
-            const h = self.head;
+            const t = self.tail;
             if (queue_len(h, t, self.data.len) < out.len) {
                 return error.NotEnoughElements;
             }
-            if (t + out.len <= self.data.len) {
+            if (h + out.len <= self.data.len) {
                 // Can copy all in one go.
-                std.mem.copyForwards(*Coroutine, out, self.data[t..(t + out.len)]);
+                std.mem.copyForwards(*Coroutine, out, self.data[h..(h + out.len)]);
             } else {
                 // Have to copy in two parts.
-                const size = self.data.len - t;
-                std.mem.copyForwards(*Coroutine, out[0..size], self.data[t..]);
+                const size = self.data.len - h;
+                std.mem.copyForwards(*Coroutine, out[0..size], self.data[h..]);
                 const rem_size = out.len - size;
                 std.mem.copyForwards(*Coroutine, out[size..], self.data[0..rem_size]);
             }
-            if (@cmpxchgWeak(usize, &self.tail, t, inc_n_wrap(t, out.len, self.data.len), .release, .acquire)) |next| {
-                t = next;
+            if (@cmpxchgWeak(usize, &self.head, h, inc_n_wrap(h, out.len, self.data.len), .release, .acquire)) |next| {
+                h = next;
                 continue;
             }
             return;
@@ -315,8 +328,8 @@ const Executor = struct {
 };
 
 fn queue_len(h: usize, t: usize, len: usize) usize {
-    const offset = if (h < t) len else 0;
-    return (h + offset) - t;
+    const offset = if (t < h) len else 0;
+    return (t + offset) - h;
 }
 
 fn inc_n_wrap(index: usize, n: usize, len: usize) usize {

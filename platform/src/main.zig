@@ -52,11 +52,7 @@ pub fn main() !void {
                 return .rearm;
             };
 
-            scheduler.global.?.poller.readyCoroutines.append(c) catch |err| {
-                log.err("Failed to queue coroutine: {}", .{err});
-                c.deinit();
-                return .rearm;
-            };
+            scheduler.global.?.poller.ready_coroutines.push(c);
             return .rearm;
         }
     }).callback);
@@ -123,12 +119,7 @@ fn socket_read(socket: xev.TCP, buffer: []u8) xev.ReadError!usize {
     };
 
     var completion: xev.Completion = undefined;
-    // TODO: we should not actually lock the pooler in a child coroutine.
-    // We should generate a list of completions and share them with the main coroutine.
-    // Then it should update the child coroutine to awaiting io and submit the completions.
-    coro.current_coroutine.?.state = .awaiting_io;
-    scheduler.global.?.poller.add_lock.lock();
-    socket.read(&scheduler.global.?.poller.loop, &completion, .{ .slice = buffer }, ReadState, &read_state, struct {
+    socket.read(null, &completion, .{ .slice = buffer }, ReadState, &read_state, struct {
         fn callback(
             state: ?*ReadState,
             _: *xev.Loop,
@@ -143,11 +134,11 @@ fn socket_read(socket: xev.TCP, buffer: []u8) xev.ReadError!usize {
             const c = state.?.*.coroutine;
             c.state = .active;
             state.?.*.result = result;
-            scheduler.global.?.poller.readyCoroutines.append(c) catch unreachable;
+            scheduler.global.?.poller.ready_coroutines.push(c);
             return .disarm;
         }
     }.callback);
-    coro.switch_context(&coro.main_coroutine);
+    coro.await_completion(&completion);
     log.debug("Loaded coroutine after read on thread: {}", .{scheduler.executor_index});
     return read_state.result;
 }
@@ -163,12 +154,7 @@ fn socket_write(socket: xev.TCP, buffer: []const u8) xev.WriteError!usize {
     };
 
     var completion: xev.Completion = undefined;
-    // TODO: we should not actually lock the pooler in a child coroutine.
-    // We should generate a list of completions and share them with the main coroutine.
-    // Then it should update the child coroutine to awaiting io and submit the completions.
-    coro.current_coroutine.?.state = .awaiting_io;
-    scheduler.global.?.poller.add_lock.lock();
-    socket.write(&scheduler.global.?.poller.loop, &completion, .{ .slice = buffer }, WriteState, &write_state, struct {
+    socket.write(null, &completion, .{ .slice = buffer }, WriteState, &write_state, struct {
         fn callback(
             state: ?*WriteState,
             _: *xev.Loop,
@@ -183,23 +169,18 @@ fn socket_write(socket: xev.TCP, buffer: []const u8) xev.WriteError!usize {
             const c = state.?.*.coroutine;
             c.state = .active;
             state.?.*.result = result;
-            scheduler.global.?.poller.readyCoroutines.append(c) catch unreachable;
+            scheduler.global.?.poller.ready_coroutines.push(c);
             return .disarm;
         }
     }.callback);
-    coro.switch_context(&coro.main_coroutine);
+    coro.await_completion(&completion);
     log.debug("Loaded coroutine after write on thread: {}", .{scheduler.executor_index});
     return write_state.result;
 }
 
 fn socket_close(socket: xev.TCP) void {
     var completion: xev.Completion = undefined;
-    // TODO: we should not actually lock the pooler in a child coroutine.
-    // We should generate a list of completions and share them with the main coroutine.
-    // Then it should update the child coroutine to awaiting io and submit the completions.
-    coro.current_coroutine.?.state = .awaiting_io;
-    scheduler.global.?.poller.add_lock.lock();
-    socket.close(&scheduler.global.?.poller.loop, &completion, coro.Coroutine, coro.current_coroutine, struct {
+    socket.close(null, &completion, coro.Coroutine, coro.current_coroutine, struct {
         fn callback(
             c: ?*coro.Coroutine,
             _: *xev.Loop,
@@ -208,10 +189,10 @@ fn socket_close(socket: xev.TCP) void {
             _: xev.ShutdownError!void,
         ) xev.CallbackAction {
             c.?.state = .active;
-            scheduler.global.?.poller.readyCoroutines.append(c.?) catch unreachable;
+            scheduler.global.?.poller.ready_coroutines.push(c.?);
             return .disarm;
         }
     }.callback);
-    coro.switch_context(&coro.main_coroutine);
+    coro.await_completion(&completion);
     log.debug("Loaded coroutine after close on thread: {}", .{scheduler.executor_index});
 }

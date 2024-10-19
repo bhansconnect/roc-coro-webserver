@@ -12,19 +12,20 @@ const Allocator = std.mem.Allocator;
 
 pub const Poller = struct {
     const Self = @This();
+    const SubmissionQueue = xev.queue_mpsc.Intrusive(xev.Completion);
+    const ReadyQueue = xev.queue.Intrusive(coro.Coroutine);
 
     loop: xev.Loop,
-    add_lock: std.Thread.Mutex,
     run_lock: std.Thread.Mutex,
-    readyCoroutines: std.ArrayList(*coro.Coroutine),
+    submission_queue: SubmissionQueue,
+    ready_coroutines: ReadyQueue,
 
-    pub fn init(allocator: Allocator) !Self {
-        return .{
-            .loop = try xev.Loop.init(.{}),
-            .add_lock = .{},
-            .run_lock = .{},
-            .readyCoroutines = std.ArrayList(*coro.Coroutine).init(allocator),
-        };
+    // Due to the submission queue, poller must init in place.
+    pub fn init(self: *Self) !void {
+        self.loop = try xev.Loop.init(.{});
+        self.run_lock = .{};
+        self.ready_coroutines = .{};
+        self.submission_queue.init();
     }
 
     pub fn deinit(self: *Self) void {

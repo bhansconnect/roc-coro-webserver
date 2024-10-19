@@ -12,6 +12,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const log = std.log.scoped(.platform);
 
+const xev = @import("xev");
+const scheduler = @import("scheduler.zig");
+
 const Allocator = std.mem.Allocator;
 
 extern fn switch_context_impl(current: [*]u64, target: [*]u64) void;
@@ -45,6 +48,12 @@ pub fn switch_context(target: ?*Coroutine) void {
     }
 }
 
+pub fn await_completion(c: *xev.Completion) void {
+    scheduler.global.?.poller.submission_queue.push(c);
+    current_coroutine.?.state = .awaiting_io;
+    switch_context(&main_coroutine);
+}
+
 const STACK_SIZE = 1024 * 1024; // 1MB stack.
 const STACK_ALIGN = 16;
 
@@ -70,6 +79,7 @@ pub const Coroutine = struct {
     arg: *void,
     mmap: []u8,
     state: State,
+    next: ?*Self = null,
 
     pub fn init(comptime Arg: type, comptime func: fn (Arg) void, arg: Arg) !*Coroutine {
         // Mmap the stack.
