@@ -12,6 +12,17 @@ pub const std_options: std.Options = .{
     .log_level = .info,
 };
 
+// There are still multiple large gain tasks that can be done to this platform for perf.
+// Obviously, this platform is also mostly a shell. It needs at lot to be more robust.
+// - No work stealing: This means too much work can be waiting in a single threads queue.
+// - No reuse: Coroutines should be reused in LIFO order. On long timeouts should be freed.
+// - Interacting with the global scheduler locks longer than necessary when pushing multiple items.
+// - No time tracking: This will be useful for polling in the background and avoiding polling too much
+// - No preemption: This will be important for cpu heavy tasks
+// - Threads are not able to attempt work in a non-blocking form before passing off to the poller (if the data is there, it should just keep running).
+// - The threads sleep for a pretty arbitrary amount of time and otherwise just spin.
+// - Threads should run the poller with delay if they have truely nothing to do (reduces spinning by blocking only one thread).
+
 var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
 var allocator: Allocator = gpa.allocator();
 
