@@ -63,6 +63,8 @@ comptime {
 }
 
 pub fn switch_context(target: ?*Coroutine) void {
+    // TODO: There are definitely bugs to fix since this needs to be disabled.
+    // std.debug.assert(target.?.state == .active);
     if (current_coroutine) |current| {
         current_coroutine = target.?;
         switch_context_impl(&current.context, &target.?.context);
@@ -74,7 +76,7 @@ pub fn switch_context(target: ?*Coroutine) void {
 }
 
 pub fn await_completion(c: *xev.Completion) void {
-    // There are definitely bugs to fix since this needs to be disabled.
+    // TODO: There are definitely bugs to fix since this needs to be disabled.
     // std.debug.assert(current_coroutine.?.state == .active);
     scheduler.global.?.poller.submission_queue.push(c);
     current_coroutine.?.state = .awaiting_io;
