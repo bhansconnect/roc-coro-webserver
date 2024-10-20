@@ -17,25 +17,50 @@ const scheduler = @import("scheduler.zig");
 
 const Allocator = std.mem.Allocator;
 
-extern fn switch_context_impl(current: [*]u64, target: [*]u64) void;
-comptime {
-    switch (builtin.cpu.arch) {
-        .aarch64 => {
-            asm (@embedFile("asm/aarch64.s"));
-        },
-        .x86_64 => {
-            asm (@embedFile("asm/x86_64.s"));
-        },
-        else => @compileError("Unsupported cpu architecture"),
-    }
-}
+const Instrinsics = switch (builtin.cpu.arch) {
+    .aarch64 => struct {
+        const switch_context_impl = @embedFile("asm/aarch64.s");
+        const context_size = 21;
 
-const context_size =
-    switch (builtin.cpu.arch) {
-    .aarch64 => 21,
-    .x86_64 => 7,
+        fn setup_context(c: *Coroutine, sp: [*]u8) void {
+            const frame_pointer_index = 18;
+            const return_pointer_index = 19;
+            const stack_pointer_index = 20;
+            c.context[stack_pointer_index] = @intFromPtr(sp);
+            c.context[frame_pointer_index] = @intFromPtr(sp);
+            c.context[return_pointer_index] = @intFromPtr(&coroutine_wrapper);
+        }
+    },
+    .x86_64 => {
+        switch (builtin.os.tag) {
+            .windows => @compileError("Windows not supported yet (needs coroutine switch asm)"),
+            else => struct {
+                const switch_context_impl = @embedFile("asm/x86_64.s");
+                const context_size = 7;
+
+                fn setup_context(c: *Coroutine, sp: [*]u8) void {
+                    // Makes space to store the return address on the stack.
+                    sp -= @sizeOf(usize);
+                    sp = @ptrFromInt(@intFromPtr(sp) & ~@as(usize, (STACK_ALIGN - 1)));
+
+                    const return_address_ptr = @as(*usize, @alignCast(@ptrCast(sp)));
+                    return_address_ptr.* = @intFromPtr(&coroutine_wrapper);
+
+                    const frame_pointer_index = 5;
+                    const stack_pointer_index = 6;
+                    c.context[stack_pointer_index] = @intFromPtr(sp);
+                    c.context[frame_pointer_index] = @intFromPtr(sp);
+                }
+            },
+        }
+    },
     else => @compileError("Unsupported cpu architecture"),
 };
+
+extern fn switch_context_impl(current: [*]u64, target: [*]u64) void;
+comptime {
+    asm (Instrinsics.switch_context_impl);
+}
 
 pub fn switch_context(target: ?*Coroutine) void {
     if (current_coroutine) |current| {
@@ -58,7 +83,7 @@ const STACK_SIZE = 1024 * 1024; // 1MB stack.
 const STACK_ALIGN = 16;
 
 pub threadlocal var main_coroutine: Coroutine = .{
-    .context = std.mem.zeroes([context_size]usize),
+    .context = std.mem.zeroes([Instrinsics.context_size]usize),
     .func = undefined,
     .arg = undefined,
     .mmap = undefined,
@@ -74,11 +99,12 @@ pub const State = enum {
 pub const Coroutine = struct {
     const Self = @This();
 
-    context: [context_size]usize,
+    context: [Instrinsics.context_size]usize,
     func: *const fn (*void) void,
     arg: *void,
     mmap: []u8,
     state: State,
+    // This enables the coroutines to be used in an intrusive queue.
     next: ?*Self = null,
 
     pub fn init(comptime Arg: type, comptime func: fn (Arg) void, arg: Arg) !*Coroutine {
@@ -97,57 +123,42 @@ pub const Coroutine = struct {
         const guard_page_size = 2 * std.mem.page_size;
         try std.posix.mprotect(mmap[0..guard_page_size], std.posix.PROT.NONE);
 
-        // Put coroutine and arg at the bottom of the stack.
-        // Not sure if this is reasonable, but it avoids extra allocations.
+        // Put coroutine in the mmap and set it up.
         var sp = @as([*]u8, @alignCast(mmap.ptr + STACK_SIZE));
         sp -= @sizeOf(Coroutine);
         sp = @ptrFromInt(@intFromPtr(sp) & ~@as(usize, (@alignOf(Coroutine) - 1)));
-        var c = @as(*Coroutine, @alignCast(@ptrCast(sp)));
 
+        var c = @as(*Coroutine, @alignCast(@ptrCast(sp)));
+        c.mmap = mmap;
+        c.reinit(Arg, func, arg);
+
+        return c;
+    }
+
+    pub fn reinit(self: *Self, comptime Arg: type, comptime func: fn (Arg) void, arg: Arg) void {
+        // Ensure this coroutine is at the correct location.
+        var sp = @as([*]u8, @alignCast(self.mmap.ptr + STACK_SIZE));
+        sp -= @sizeOf(Coroutine);
+        sp = @ptrFromInt(@intFromPtr(sp) & ~@as(usize, (@alignOf(Coroutine) - 1)));
+        std.debug.assert(@intFromPtr(self) == @intFromPtr(sp));
+
+        // Put the arg on the stack.
         sp -= @sizeOf(Arg);
         sp = @ptrFromInt(@intFromPtr(sp) & ~@as(usize, (@alignOf(Arg) - 1)));
         const arg_ptr = @as(*Arg, @alignCast(@ptrCast(sp)));
         arg_ptr.* = arg;
 
+        // Align the stack for actual use.
         sp = @ptrFromInt(@intFromPtr(sp) & ~@as(usize, (STACK_ALIGN - 1)));
 
-        c.func = struct {
+        self.func = struct {
             fn func_wrapper(ptr: *void) void {
                 func(@as(*Arg, @alignCast(@ptrCast(ptr))).*);
             }
         }.func_wrapper;
-        c.mmap = mmap;
-        c.arg = @ptrCast(arg_ptr);
-        for (0..c.context.len) |i| {
-            c.context[i] = 0;
-        }
-        switch (builtin.cpu.arch) {
-            .aarch64 => {
-                const frame_pointer_index = 18;
-                const return_pointer_index = 19;
-                const stack_pointer_index = 20;
-                c.context[stack_pointer_index] = @intFromPtr(sp);
-                c.context[frame_pointer_index] = @intFromPtr(sp);
-                c.context[return_pointer_index] = @intFromPtr(&coroutine_wrapper);
-            },
-            .x86_64 => {
-                // Makes space to store the return address on the stack.
-                sp -= @sizeOf(usize);
-                sp = @ptrFromInt(@intFromPtr(sp) & ~@as(usize, (STACK_ALIGN - 1)));
-
-                const return_address_ptr = @as(*usize, @alignCast(@ptrCast(sp)));
-                return_address_ptr.* = @intFromPtr(&coroutine_wrapper);
-
-                const frame_pointer_index = 5;
-                const stack_pointer_index = 6;
-                c.context[stack_pointer_index] = @intFromPtr(sp);
-                c.context[frame_pointer_index] = @intFromPtr(sp);
-            },
-            else => @compileError("Unsupported cpu architecture"),
-        }
-        c.state = .active;
-
-        return c;
+        self.arg = @ptrCast(arg_ptr);
+        Instrinsics.setup_context(self, sp);
+        self.state = .active;
     }
 
     pub fn deinit(self: *Self) void {
