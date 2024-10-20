@@ -22,6 +22,7 @@ pub fn init_global(allocator: Allocator, config: Scheduler.Config) !void {
 
     const num_executors = if (config.num_executors == 0) try std.Thread.getCpuCount() else config.num_executors;
     global.?.executors = try allocator.alloc(Executor, num_executors);
+    global.?.executor_coprimes = try create_coprimes(allocator, num_executors);
     for (global.?.executors, 0..) |*exec, i| {
         exec.* = try Executor.init(allocator, i, config.executor_config);
         exec.thread = try std.Thread.spawn(.{}, Executor.start, .{exec});
@@ -43,6 +44,9 @@ pub const Scheduler = struct {
     queue: xev.queue.Intrusive(Coroutine),
     length: usize,
     executors: []Executor,
+    // This is used to enable random orders of the the executors.
+    // If the step is coprime, it is guaranteed to walk all executors.
+    executor_coprimes: []u16,
     poller: Poller,
 
     pub fn is_empty(self: *Self) bool {
@@ -90,20 +94,24 @@ const Executor = struct {
     };
 
     thread: ?std.Thread = null,
+    // TODO: Many uses of copy buf where the queue is empty should write directly into the data.
     copy_buf: []*Coroutine,
     data: []*Coroutine,
     // In this queue, you push to tail and pop from head.
     head: usize,
     tail: usize,
     index: usize,
+    rand: std.Random.Pcg,
 
     fn init(allocator: Allocator, index: usize, config: Config) !Self {
+        const seed: u64 = @as(usize, @intCast(std.time.nanoTimestamp())) *% index;
         return .{
             .copy_buf = try allocator.alloc(*Coroutine, config.queue_size),
             .data = try allocator.alloc(*Coroutine, config.queue_size),
             .head = 0,
             .tail = 0,
             .index = index,
+            .rand = std.Random.Pcg.init(seed),
         };
     }
 
@@ -116,7 +124,7 @@ const Executor = struct {
         var tick: u8 = 0;
         while (true) {
             var next_coroutine: ?*Coroutine = null;
-            while (next_coroutine == null) : (tick +%= 1) {
+            find_next: while (next_coroutine == null) : (tick +%= 1) {
                 // It has been a while, try to take one from the global scheduler.
                 // This ensures nothing is left for too long in the global queue.
                 if (tick % 61 == 0) {
@@ -177,24 +185,41 @@ const Executor = struct {
                                 break;
                             }
                         }
-                        var to_queue = self.copy_buf[0..index];
-                        const local_count = @min(to_queue.len, self.available());
-                        try self.push_many(to_queue[0..local_count]);
-                        to_queue = to_queue[local_count..];
-                        if (to_queue.len > 0) {
-                            sched.lock.lock();
-                            defer sched.lock.unlock();
-                            for (to_queue) |c| {
-                                sched.push(c);
-                            }
-                        }
+                        try self.queue_buf(sched, self.copy_buf[0..index]);
                     }
                     if (next_coroutine != null) {
                         break;
                     }
                 }
 
-                // TODO: Steal work from other executors.
+                // Simple work stealing.
+                // 1. Walk all executors in a random order.
+                // 2. If any executor has work, attempt to take half.
+                if (false) {
+                    var pos = self.rand.random().uintLessThan(usize, sched.executors.len);
+                    const inc_offset = self.rand.random().uintLessThan(usize, sched.executor_coprimes.len);
+                    const inc = sched.executor_coprimes[inc_offset];
+                    for (0..sched.executors.len) |_| {
+                        defer pos = (pos + inc) % sched.executors.len;
+
+                        // Can't steal work from self.
+                        if (pos == executor_index) continue;
+
+                        var e = sched.executors[pos];
+                        // No workt to steal...;
+                        if (e.len() <= 0) continue;
+
+                        // Attempt stealing...
+                        log.info("Attempt steal", .{});
+                        const n = e.attempt_steal(self.copy_buf);
+                        if (n == 0) continue;
+
+                        next_coroutine = self.copy_buf[0];
+                        try self.queue_buf(sched, self.copy_buf[1..n]);
+                        log.info("Stole work: {}", .{n});
+                        break :find_next;
+                    }
+                }
 
                 // Might be worth trying netpoller with a delay here.
                 // That is what go does kinda...
@@ -240,15 +265,29 @@ const Executor = struct {
         }
     }
 
-    pub fn cap(self: *Self) usize {
+    pub fn queue_buf(self: *Self, sched: *Scheduler, buf: []*Coroutine) !void {
+        var to_queue = buf;
+        const local_count = @min(to_queue.len, self.available());
+        try self.push_many(to_queue[0..local_count]);
+        to_queue = to_queue[local_count..];
+        if (to_queue.len > 0) {
+            sched.lock.lock();
+            defer sched.lock.unlock();
+            for (to_queue) |c| {
+                sched.push(c);
+            }
+        }
+    }
+
+    pub fn cap(self: *const Self) usize {
         return self.data.len - 1;
     }
 
-    pub fn len(self: *Self) usize {
+    pub fn len(self: *const Self) usize {
         return queue_len(self.head, self.tail, self.data.len);
     }
 
-    fn available(self: *Self) usize {
+    fn available(self: *const Self) usize {
         return self.cap() - self.len();
     }
 
@@ -256,6 +295,8 @@ const Executor = struct {
         std.debug.assert(self.index == executor_index);
         var t = @atomicLoad(usize, &self.tail, .acquire);
         while (true) {
+            // It is ok if this is an outdated value for head.
+            // That just leads to the queue being full a bit early.
             const h = self.head;
             if (queue_len(h, t, self.data.len) == self.cap()) {
                 return error.QueueFull;
@@ -275,6 +316,8 @@ const Executor = struct {
 
         var t = @atomicLoad(usize, &self.tail, .acquire);
         while (true) {
+            // It is ok if this is an outdated value for head.
+            // That just leads to the queue being full a bit early.
             const h = self.head;
             if (queue_len(h, t, self.data.len) + elems.len > self.cap()) {
                 return error.QueueFull;
@@ -302,6 +345,8 @@ const Executor = struct {
     fn pop(self: *Self) !*Coroutine {
         var h = @atomicLoad(usize, &self.head, .acquire);
         while (true) {
+            // It is ok if this is an outdated value for tail.
+            // That just leads to the queue being empty a bit early.
             const t = self.tail;
             if (t == h) {
                 return error.QueueEmpty;
@@ -318,6 +363,8 @@ const Executor = struct {
     fn pop_many(self: *Self, out: []*Coroutine) !void {
         var h = @atomicLoad(usize, &self.head, .acquire);
         while (true) {
+            // It is ok if this is an outdated value for tail.
+            // That just leads to the queue being empty a bit early.
             const t = self.tail;
             if (queue_len(h, t, self.data.len) < out.len) {
                 return error.NotEnoughElements;
@@ -339,6 +386,44 @@ const Executor = struct {
             return;
         }
     }
+
+    fn attempt_steal(self: *Self, out: []*Coroutine) usize {
+        // This is a fancy version of pop with more atomics to sync with producers and consumers.
+        // It also only grabs at most half of the queue.
+
+        // head must be in sync with consumers.
+        var h = @atomicLoad(usize, &self.head, .acquire);
+        while (true) {
+            // tail must be in sync with producers.
+            const t = @atomicLoad(usize, &self.tail, .acquire);
+            var n = queue_len(h, t, self.data.len);
+            // goal is to steal half.
+            n = n - n / 2;
+            n = @min(n, out.len);
+            if (n == 0) {
+                return 0;
+            }
+            if (n > self.cap() / 2) {
+                // inconsistent read.
+                continue;
+            }
+            if (h + n <= self.data.len) {
+                // Can copy all in one go.
+                std.mem.copyForwards(*Coroutine, out, self.data[h..(h + n)]);
+            } else {
+                // Have to copy in two parts.
+                const size = self.data.len - h;
+                std.mem.copyForwards(*Coroutine, out[0..size], self.data[h..]);
+                const rem_size = n - size;
+                std.mem.copyForwards(*Coroutine, out[size..], self.data[0..rem_size]);
+            }
+            if (@cmpxchgWeak(usize, &self.head, h, inc_n_wrap(h, n, self.data.len), .release, .acquire)) |next| {
+                h = next;
+                continue;
+            }
+            return n;
+        }
+    }
 };
 
 fn queue_len(h: usize, t: usize, len: usize) usize {
@@ -358,4 +443,36 @@ fn inc_n_wrap(index: usize, n: usize, len: usize) usize {
 
 fn inc_wrap(i: usize, len: usize) usize {
     return inc_n_wrap(i, 1, len);
+}
+
+fn gcd(comptime T: type, x: T, y: T) T {
+    var a = x;
+    var b = y;
+    while (b != 0) {
+        const tmp = a % b;
+        a = b;
+        b = tmp;
+    }
+    return a;
+}
+
+fn create_coprimes(allocator: Allocator, count_usize: usize) ![]u16 {
+    // I don't think anyone will want more than 4096 executors.
+    // If someone does....I just don't know.
+    // This generally will be number of cpu cores.
+    const max = 4096;
+    var buf: [max]u16 = undefined;
+    var size: u16 = 0;
+    std.debug.assert(count_usize < max);
+    const count: u16 = @intCast(count_usize);
+    for (1..count) |i_usize| {
+        const i: u16 = @intCast(i_usize);
+        if (gcd(u16, i, count) == 1) {
+            buf[size] = i;
+            size += 1;
+        }
+    }
+    const out = try allocator.alloc(u16, size);
+    std.mem.copyForwards(u16, out, buf[0..size]);
+    return out;
 }
