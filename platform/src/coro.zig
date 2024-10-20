@@ -31,28 +31,27 @@ const Instrinsics = switch (builtin.cpu.arch) {
             c.context[return_pointer_index] = @intFromPtr(&coroutine_wrapper);
         }
     },
-    .x86_64 => {
-        switch (builtin.os.tag) {
-            .windows => @compileError("Windows not supported yet (needs coroutine switch asm)"),
-            else => struct {
-                const switch_context_impl = @embedFile("asm/x86_64.s");
-                const context_size = 7;
+    .x86_64 => switch (builtin.os.tag) {
+        .windows => @compileError("Windows not supported yet (needs coroutine switch asm)"),
+        else => struct {
+            const switch_context_impl = @embedFile("asm/x86_64.s");
+            const context_size = 7;
 
-                fn setup_context(c: *Coroutine, sp: [*]u8) void {
-                    // Makes space to store the return address on the stack.
-                    sp -= @sizeOf(usize);
-                    sp = @ptrFromInt(@intFromPtr(sp) & ~@as(usize, (STACK_ALIGN - 1)));
+            fn setup_context(c: *Coroutine, stack_base: [*]u8) void {
+                // Makes space to store the return address on the stack.
+                var sp = stack_base;
+                sp -= @sizeOf(usize);
+                sp = @ptrFromInt(@intFromPtr(sp) & ~@as(usize, (STACK_ALIGN - 1)));
 
-                    const return_address_ptr = @as(*usize, @alignCast(@ptrCast(sp)));
-                    return_address_ptr.* = @intFromPtr(&coroutine_wrapper);
+                const return_address_ptr = @as(*usize, @alignCast(@ptrCast(sp)));
+                return_address_ptr.* = @intFromPtr(&coroutine_wrapper);
 
-                    const frame_pointer_index = 5;
-                    const stack_pointer_index = 6;
-                    c.context[stack_pointer_index] = @intFromPtr(sp);
-                    c.context[frame_pointer_index] = @intFromPtr(sp);
-                }
-            },
-        }
+                const frame_pointer_index = 5;
+                const stack_pointer_index = 6;
+                c.context[stack_pointer_index] = @intFromPtr(sp);
+                c.context[frame_pointer_index] = @intFromPtr(sp);
+            }
+        },
     },
     else => @compileError("Unsupported cpu architecture"),
 };
