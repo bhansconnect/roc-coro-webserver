@@ -228,6 +228,10 @@ const Executor = struct {
                 // 1ms is arbitrary.
                 std.posix.nanosleep(0, 1000 * 1000);
             }
+            // TODO: There are definitely bugs to fix since this needs to be disabled.
+            // That said, they seem to be mac/kqueue specific?
+            // That and work stealing breaks it.
+            // std.debug.assert(next_coroutine.?.state == .active);
             coro.switch_context(next_coroutine.?);
             switch (next_coroutine.?.state) {
                 .active => {
