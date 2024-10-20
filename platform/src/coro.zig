@@ -74,6 +74,7 @@ pub fn switch_context(target: ?*Coroutine) void {
 }
 
 pub fn await_completion(c: *xev.Completion) void {
+    std.debug.assert(current_coroutine.?.state == .active);
     scheduler.global.?.poller.submission_queue.push(c);
     current_coroutine.?.state = .awaiting_io;
     switch_context(&main_coroutine);
