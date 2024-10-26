@@ -10,9 +10,15 @@ const coro = @import("coro.zig");
 
 const Allocator = std.mem.Allocator;
 
+pub const idle_buffer_size = 64;
+
 pub const IdleSocket = struct {
     completion: xev.Completion,
     socket: xev.TCP,
+    // The goal of this buffer is to potentially read the first line.
+    // It uses minimal resources, but can quick fail some http requests that are clearly invalid.
+    // TODO: tune size.
+    idle_buffer: [idle_buffer_size]u8,
     next: ?*IdleSocket,
 };
 

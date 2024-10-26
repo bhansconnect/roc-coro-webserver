@@ -81,8 +81,6 @@ pub fn main() !void {
     }
 }
 
-const zero_sized_buffer = [0]u8{};
-
 fn socket_set_idle(socket: xev.TCP) void {
     // This function waits for the first bytes of an http request.
     // Once bytes are ready to be recieved, it launches a coroutine to actually handle the request.
@@ -103,7 +101,7 @@ fn socket_set_idle(socket: xev.TCP) void {
     idle_socket.next = null;
     idle_socket.socket = socket;
     // Store the socket fd in the pointer to avoid any sort of extra allocation here.
-    socket.read(null, &idle_socket.completion, .{ .slice = &zero_sized_buffer }, IdleSocket, idle_socket, struct {
+    socket.read(null, &idle_socket.completion, .{ .slice = &idle_socket.idle_buffer }, IdleSocket, idle_socket, struct {
         fn callback(
             idle_socket_inner: ?*IdleSocket,
             _: *xev.Loop,
@@ -112,32 +110,33 @@ fn socket_set_idle(socket: xev.TCP) void {
             _: xev.ReadBuffer,
             result: xev.ReadError!usize,
         ) xev.CallbackAction {
-            const len = result catch |err| brk: {
+            const len = result catch |err| {
                 if (err == error.WouldBlock) {
                     return .rearm;
                 }
-                if (err == error.EOF) {
-                    // Given we used a zero sized buffer, consider this the same as 0.
-                    // This could be a real EOF or it might not be.
-                    // libxev should be avoiding converting to EOF on a zero sized buffer, but it does.
-                    // If it is a real EOF, it will be caught when the thread becomes active.
-                    break :brk 0;
-                }
-                // TODO: on other errors, properly close the socket.
+                // TODO: on error, properly close the socket.
                 log.err("unhandled error {}", .{err});
                 return .disarm;
             };
-            std.debug.assert(len == 0);
+
+            var args = HandleRequestArgs{
+                .socket = idle_socket_inner.?.socket,
+                .idle_buffer = undefined,
+                .read_len = len,
+            };
+            // TODO: I assume copying all bytes of this small buffer is actually faster than doing a partial copy.
+            // Verify this.
+            std.mem.copyForwards(u8, &args.idle_buffer, &idle_socket_inner.?.idle_buffer);
 
             if (scheduler.global.?.poller.coroutine_pool.pop()) |c| {
-                c.reinit(xev.TCP, handle_request, idle_socket_inner.?.socket);
+                c.reinit(HandleRequestArgs, handle_request, args);
                 scheduler.global.?.poller.ready_coroutines.push(c);
                 scheduler.global.?.poller.idle_socket_pool.push(idle_socket_inner.?);
                 return .disarm;
             }
 
             // Need to allocate a new coroutine.
-            const c = Coroutine.init(xev.TCP, handle_request, idle_socket_inner.?.socket) catch |err| {
+            const c = Coroutine.init(HandleRequestArgs, handle_request, args) catch |err| {
                 log.err("Failed to create coroutine: {}", .{err});
                 // TODO: Should 500 and close socket.
                 return .disarm;
@@ -150,7 +149,13 @@ fn socket_set_idle(socket: xev.TCP) void {
     scheduler.global.?.poller.submission_queue.push(&idle_socket.completion);
 }
 
-fn handle_request(socket: xev.TCP) void {
+const HandleRequestArgs = struct {
+    socket: xev.TCP,
+    idle_buffer: [poller.idle_buffer_size]u8,
+    read_len: usize,
+};
+
+fn handle_request(args: HandleRequestArgs) void {
     // The goal here is to parse an http request for roc.
     // This needs to be robust and secure in the long run.
     // Basic steps:
@@ -171,20 +176,42 @@ fn handle_request(socket: xev.TCP) void {
     // 4. If a request headers are too big (16KB limit), simply fail it (also maybe limit body size).
     log.debug("Launched coroutine on thread: {}", .{scheduler.executor_index});
 
+    const socket = args.socket;
+    // TODO: I assume copying all bytes of this small buffer is actually faster than doing a partial copy.
+    // Verify this.
+    var buffer: [4096]u8 = undefined;
+    std.mem.copyForwards(u8, &buffer, &args.idle_buffer);
+
     // TODO: everything here needs timeouts.
 
     // This socket should be ready to go.
     // Lets give it a real buffer and load the headers/body.
-    var buffer: [4096]u8 = undefined;
-    const len = socket_read(socket, &buffer) catch |err| {
-        if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
-            log.warn("Failed to read from tcp connection: {}", .{err});
+    // TODO: make this a lot smarter. Actually handle parsing.
+    // For now, just load the full request.
+    // Also, do we need to worry about accidentally loading part of the next request?
+    var scanned: usize = 0;
+    var full_len = args.read_len;
+    // This double new line ends a header.
+    const target = "\r\n\r\n";
+    while (std.mem.indexOfPos(u8, buffer[0..full_len], scanned, target) == null) {
+        scanned = full_len -| (target.len - 1);
+        if (full_len >= buffer.len) {
+            // TODO: send error if needed before closing the socket?
+            socket_close(socket);
+            return;
         }
-        // TODO: send error if needed before closing the socket?
-        socket_close(socket);
-        return;
-    };
-    log.debug("Request:\n{s}\n\n", .{buffer[0..len]});
+
+        const len = socket_read(socket, buffer[full_len..]) catch |err| {
+            if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
+                log.warn("Failed to read from tcp connection: {}", .{err});
+            }
+            // TODO: send error if needed before closing the socket?
+            socket_close(socket);
+            return;
+        };
+        full_len += len;
+    }
+    log.debug("Request:\n{s}\n\n", .{buffer[0..full_len]});
 
     // TODO: Call into roc and setup a basic web request in roc to get the response.
 
