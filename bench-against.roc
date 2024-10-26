@@ -9,8 +9,4 @@ server = { init: Task.ok {}, respond }
 
 respond : Request, Model -> Task Response [ServerErr Str]_
 respond = \_req, _ ->
-    # Pretend we are doing an http request to a database.
-    # Cost 20ms.
-    Sleep.millis! 20
-
     Task.ok { status: 200, headers: [], body: Str.toUtf8 "Hello, World!" }

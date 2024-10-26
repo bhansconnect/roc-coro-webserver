@@ -104,12 +104,7 @@ fn handle_tcp_requests(socket: xev.TCP) void {
             };
         }
 
-        // Pretend we are doing an http request to a database.
-        // Cost 20ms.
-        sleep(&timer, 20) catch |err| {
-            log.warn("Failed to sleep: {}", .{err});
-            break :outer;
-        };
+        // TODO: Call into roc and setup a basic web request in roc to get the response.
 
         const response =
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 13\r\n\r\nHello, World!";
