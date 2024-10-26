@@ -2,10 +2,12 @@ const std = @import("std");
 const xev = @import("xev");
 const coro = @import("coro.zig");
 const scheduler = @import("scheduler.zig");
+const poller = @import("poller.zig");
 
 const Allocator = std.mem.Allocator;
 const Coroutine = coro.Coroutine;
 const Scheduler = scheduler.Scheduler;
+const IdleSocket = poller.IdleSocket;
 
 const log = std.log.scoped(.platform);
 pub const std_options: std.Options = .{
@@ -59,16 +61,7 @@ pub fn main() !void {
             };
             log.debug("Accepting new TCP connection", .{});
 
-            // TODO: reuse coroutines here.
-            // Well, actually it would be best to just queue a zero sized read with a timeout here.
-            // Only if that succeeds, grab a coroutine and run an individual request.
-            // Once the request is done queue another zero sized read and puth the coroutine back in a pool for reuse.
-            const c = Coroutine.init(xev.TCP, handle_tcp_requests, socket) catch |err| {
-                log.err("Failed to create coroutine: {}", .{err});
-                return .rearm;
-            };
-
-            scheduler.global.?.poller.ready_coroutines.push(c);
+            socket_set_idle(socket);
             return .rearm;
         }
     }).callback);
@@ -88,56 +81,76 @@ pub fn main() !void {
     }
 }
 
-fn handle_tcp_requests(socket: xev.TCP) void {
-    // TODO: don't use up a coroutine until a tcp connection is actively handling bytes.
-    // Instead, through the tcp request in the io poll with a zero sized read (and idle timeout).
-    // Once the read returns, claim a coroutine and lunch into handling exactly one request before pushing back to idle.
-    // Make sure to have a lifo of coroutines and clean up old coroutines when the server is under low load.
-    log.debug("Launched coroutine on thread: {}", .{scheduler.executor_index});
+const zero_sized_buffer = [0]u8{};
 
-    var timer = try xev.Timer.init();
-    defer timer.deinit();
-    outer: while (true) {
-        // We don't want to waste memory for every single idle connection.
-        // As such, we first do a zero byte read (in the future, this would be dealt with before launching a coroutine).
-        // Once that read succeeds, we know that the os has data waiting for us.
-        // Technically, it would next be best to directly call the os read method instead of going back to libxev.
-        // For simplicity, we directly use libxev for now even though data should be ready for us.
-        var idle_buffer: [0]u8 = undefined;
-        const len = socket_read(socket, &idle_buffer) catch |err| {
-            if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
-                log.warn("Failed to read from tcp connection: {}", .{err});
-            }
-            break :outer;
+fn socket_set_idle(socket: xev.TCP) void {
+    // This function waits for the first bytes of an http request.
+    // Once bytes are ready to be recieved, it launches a coroutine to actually handle the request.
+    // This greatly reduces the memory cost of an idle socket.
+
+    // TODO: add a timeout for max wait for headers bytes to come in.
+
+    var idle_socket: *IdleSocket = undefined;
+    if (scheduler.global.?.poller.idle_socket_pool.pop()) |s| {
+        idle_socket = s;
+    } else {
+        idle_socket = allocator.create(IdleSocket) catch |err| {
+            log.err("Failed to allocate idle socket: {}", .{err});
+            // TODO: Should 500 and close socket.
+            return;
         };
-        std.debug.assert(len == 0);
-
-        // We have data. This is now an active TCP conection.
-
-        // TODO: Call into roc and setup a basic web request in roc to get the response.
-
-        const response =
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 13\r\n\r\nHello, World!";
-
-        var write_len: usize = 0;
-        // TODO: handle partial reads.
-        // For now just re-read on any empty reads.
-        while (write_len == 0) {
-            const result = socket_write(socket, response);
-            write_len = result catch |err| {
-                if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
-                    log.warn("Failed to write to tcp connection: {}", .{err});
-                }
-                break :outer;
-            };
-        }
     }
-    socket_close(socket);
+    idle_socket.next = null;
+    idle_socket.socket = socket;
+    // Store the socket fd in the pointer to avoid any sort of extra allocation here.
+    socket.read(null, &idle_socket.completion, .{ .slice = &zero_sized_buffer }, IdleSocket, idle_socket, struct {
+        fn callback(
+            idle_socket_inner: ?*IdleSocket,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            _: xev.TCP,
+            _: xev.ReadBuffer,
+            result: xev.ReadError!usize,
+        ) xev.CallbackAction {
+            const len = result catch |err| brk: {
+                if (err == error.WouldBlock) {
+                    return .rearm;
+                }
+                if (err == error.EOF) {
+                    // Given we used a zero sized buffer, consider this the same as 0.
+                    // This could be a real EOF or it might not be.
+                    // libxev should be avoiding converting to EOF on a zero sized buffer, but it does.
+                    // If it is a real EOF, it will be caught when the thread becomes active.
+                    break :brk 0;
+                }
+                // TODO: on other errors, properly close the socket.
+                log.err("unhandled error {}", .{err});
+                return .disarm;
+            };
+            std.debug.assert(len == 0);
+
+            if (scheduler.global.?.poller.coroutine_pool.pop()) |c| {
+                c.reinit(xev.TCP, handle_request, idle_socket_inner.?.socket);
+                scheduler.global.?.poller.ready_coroutines.push(c);
+                scheduler.global.?.poller.idle_socket_pool.push(idle_socket_inner.?);
+                return .disarm;
+            }
+
+            // Need to allocate a new coroutine.
+            const c = Coroutine.init(xev.TCP, handle_request, idle_socket_inner.?.socket) catch |err| {
+                log.err("Failed to create coroutine: {}", .{err});
+                // TODO: Should 500 and close socket.
+                return .disarm;
+            };
+            scheduler.global.?.poller.ready_coroutines.push(c);
+            scheduler.global.?.poller.idle_socket_pool.push(idle_socket_inner.?);
+            return .disarm;
+        }
+    }.callback);
+    scheduler.global.?.poller.submission_queue.push(&idle_socket.completion);
 }
 
-// This function is noinline to ensure it's header buffer is only
-// allocated
-noinline fn handle_request() void {
+fn handle_request(socket: xev.TCP) void {
     // The goal here is to parse an http request for roc.
     // This needs to be robust and secure in the long run.
     // Basic steps:
@@ -155,38 +168,48 @@ noinline fn handle_request() void {
     // 1. Everything needs a timeout and cancelation. This protects from things like sloworis.
     // 2. We should generally fail fast, respond with an error, and close connections.
     // 3. We need to be careful to block broken unicode and trick headers.
-    // 4. If a request is too big (16KB limit), simply fail it.
-}
+    // 4. If a request headers are too big (16KB limit), simply fail it (also maybe limit body size).
+    log.debug("Launched coroutine on thread: {}", .{scheduler.executor_index});
 
-fn sleep(timer: *xev.Timer, millis: u64) xev.Timer.RunError!void {
-    const SleepState = struct {
-        coroutine: *Coroutine,
-        result: xev.Timer.RunError!void,
-    };
-    var sleep_state = SleepState{
-        .coroutine = coro.current_coroutine.?,
-        .result = undefined,
-    };
-    var completion: xev.Completion = undefined;
-    // This may require locking the poller based on how timers work...
-    timer.run(&scheduler.global.?.poller.loop, &completion, millis, SleepState, &sleep_state, struct {
-        fn callback(
-            state: ?*SleepState,
-            _: *xev.Loop,
-            _: *xev.Completion,
-            result: xev.Timer.RunError!void,
-        ) xev.CallbackAction {
-            const c = state.?.*.coroutine;
-            c.state = .active;
-            state.?.*.result = result;
-            scheduler.global.?.poller.ready_coroutines.push(c);
-            return .disarm;
+    // TODO: everything here needs timeouts.
+
+    // This socket should be ready to go.
+    // Lets give it a real buffer and load the headers/body.
+    var buffer: [4096]u8 = undefined;
+    const len = socket_read(socket, &buffer) catch |err| {
+        if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
+            log.warn("Failed to read from tcp connection: {}", .{err});
         }
-    }.callback);
+        // TODO: send error if needed before closing the socket?
+        socket_close(socket);
+        return;
+    };
+    log.debug("Request:\n{s}\n\n", .{buffer[0..len]});
 
-    coro.await_completion(&completion);
-    log.debug("Loaded coroutine after sleep on thread: {}", .{scheduler.executor_index});
-    return sleep_state.result;
+    // TODO: Call into roc and setup a basic web request in roc to get the response.
+
+    const response =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 13\r\n\r\nHello, World!";
+
+    var write_len: usize = 0;
+    // TODO: handle partial reads.
+    // For now just re-read on any empty reads.
+    while (write_len == 0) {
+        const result = socket_write(socket, response);
+        write_len = result catch |err| {
+            if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
+                log.warn("Failed to write to tcp connection: {}", .{err});
+            }
+            // TODO: send error if needed before closing the socket?
+            socket_close(socket);
+            return;
+        };
+    }
+
+    // TODO: Here we should close the socket if keep alive is off.
+
+    // Return the socket to the idle pool.
+    socket_set_idle(socket);
 }
 
 fn socket_read(socket: xev.TCP, buffer: []u8) xev.ReadError!usize {

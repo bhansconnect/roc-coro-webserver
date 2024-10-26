@@ -131,6 +131,7 @@ pub const Coroutine = struct {
         sp = @ptrFromInt(@intFromPtr(sp) & ~@as(usize, (@alignOf(Coroutine) - 1)));
 
         var c = @as(*Coroutine, @alignCast(@ptrCast(sp)));
+        c.next = null;
         c.mmap = mmap;
         c.reinit(Arg, func, arg);
 

@@ -263,7 +263,7 @@ const Executor = struct {
                 },
                 .awaiting_io => {},
                 .done => {
-                    next_coroutine.?.deinit();
+                    poller.coroutine_pool.push(next_coroutine.?);
                 },
             }
         }
