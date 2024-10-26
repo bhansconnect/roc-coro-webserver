@@ -23,6 +23,8 @@ pub const std_options: std.Options = .{
 // - The threads sleep for a pretty arbitrary amount of time and otherwise just spin.
 // - Threads should run the poller with delay if they have truely nothing to do (reduces spinning by blocking only one thread).
 
+// TODO: evaluate if GPA is slow and hurting perf.
+// Might be better to use the c allocator or https://github.com/joadnacer/jdz_allocator/
 var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
 var allocator: Allocator = gpa.allocator();
 
@@ -57,6 +59,10 @@ pub fn main() !void {
             };
             log.debug("Accepting new TCP connection", .{});
 
+            // TODO: reuse coroutines here.
+            // Well, actually it would be best to just queue a zero sized read with a timeout here.
+            // Only if that succeeds, grab a coroutine and run an individual request.
+            // Once the request is done queue another zero sized read and puth the coroutine back in a pool for reuse.
             const c = Coroutine.init(xev.TCP, handle_tcp_requests, socket) catch |err| {
                 log.err("Failed to create coroutine: {}", .{err});
                 return .rearm;
@@ -83,26 +89,30 @@ pub fn main() !void {
 }
 
 fn handle_tcp_requests(socket: xev.TCP) void {
+    // TODO: don't use up a coroutine until a tcp connection is actively handling bytes.
+    // Instead, through the tcp request in the io poll with a zero sized read (and idle timeout).
+    // Once the read returns, claim a coroutine and lunch into handling exactly one request before pushing back to idle.
+    // Make sure to have a lifo of coroutines and clean up old coroutines when the server is under low load.
     log.debug("Launched coroutine on thread: {}", .{scheduler.executor_index});
-
-    var buffer: [4096]u8 = undefined;
 
     var timer = try xev.Timer.init();
     defer timer.deinit();
-    // We technically should be checking keepalive, but for now, just loop.
     outer: while (true) {
-        var read_len: usize = 0;
-        // TODO: handle partial reads.
-        // For now just re-read on any empty reads.
-        while (read_len == 0) {
-            const result = socket_read(socket, &buffer);
-            read_len = result catch |err| {
-                if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
-                    log.warn("Failed to read from tcp connection: {}", .{err});
-                }
-                break :outer;
-            };
-        }
+        // We don't want to waste memory for every single idle connection.
+        // As such, we first do a zero byte read (in the future, this would be dealt with before launching a coroutine).
+        // Once that read succeeds, we know that the os has data waiting for us.
+        // Technically, it would next be best to directly call the os read method instead of going back to libxev.
+        // For simplicity, we directly use libxev for now even though data should be ready for us.
+        var idle_buffer: [0]u8 = undefined;
+        const len = socket_read(socket, &idle_buffer) catch |err| {
+            if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
+                log.warn("Failed to read from tcp connection: {}", .{err});
+            }
+            break :outer;
+        };
+        std.debug.assert(len == 0);
+
+        // We have data. This is now an active TCP conection.
 
         // TODO: Call into roc and setup a basic web request in roc to get the response.
 
@@ -123,6 +133,29 @@ fn handle_tcp_requests(socket: xev.TCP) void {
         }
     }
     socket_close(socket);
+}
+
+// This function is noinline to ensure it's header buffer is only
+// allocated
+noinline fn handle_request() void {
+    // The goal here is to parse an http request for roc.
+    // This needs to be robust and secure in the long run.
+    // Basic steps:
+    // 1. Have a SWAR/SIMD scanner for for crln. Record the start of each line.
+    //     1.5. Can we have something at the same time scan that everything is valid utf8 or fail fast?
+    // 2. After the first new line, validate it is right http version and such. Fail fast if not.
+    // 3. Just keep scanning until a double newline is hit (headers all recieved).
+    // 4. Parse each header to ensure it is valid (maybe could be done with step 1?)
+    // 5. Find content length header (or in the future content encoding, but skipping that for now).
+    // 6. Allocate a buffer for the body if it doesn't fit directly in the header buffer (eventually reuse buffers).
+    // 7. Copy first chunk of body over to new buffer.
+    // 8. Recieve rest of body.
+    // 9. Get everything in roc format and call roc.
+    // Extra defense notes:
+    // 1. Everything needs a timeout and cancelation. This protects from things like sloworis.
+    // 2. We should generally fail fast, respond with an error, and close connections.
+    // 3. We need to be careful to block broken unicode and trick headers.
+    // 4. If a request is too big (16KB limit), simply fail it.
 }
 
 fn sleep(timer: *xev.Timer, millis: u64) xev.Timer.RunError!void {
