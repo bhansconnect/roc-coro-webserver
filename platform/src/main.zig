@@ -87,6 +87,8 @@ fn handle_tcp_requests(socket: xev.TCP) void {
 
     var buffer: [4096]u8 = undefined;
 
+    var timer = try xev.Timer.init();
+    defer timer.deinit();
     // We technically should be checking keepalive, but for now, just loop.
     outer: while (true) {
         var read_len: usize = 0;
@@ -101,6 +103,13 @@ fn handle_tcp_requests(socket: xev.TCP) void {
                 break :outer;
             };
         }
+
+        // Pretend we are doing an http request to a database.
+        // Cost 20ms.
+        sleep(&timer, 20) catch |err| {
+            log.warn("Failed to sleep: {}", .{err});
+            break :outer;
+        };
 
         const response =
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 13\r\n\r\nHello, World!";
@@ -119,6 +128,37 @@ fn handle_tcp_requests(socket: xev.TCP) void {
         }
     }
     socket_close(socket);
+}
+
+fn sleep(timer: *xev.Timer, millis: u64) xev.Timer.RunError!void {
+    const SleepState = struct {
+        coroutine: *Coroutine,
+        result: xev.Timer.RunError!void,
+    };
+    var sleep_state = SleepState{
+        .coroutine = coro.current_coroutine.?,
+        .result = undefined,
+    };
+    var completion: xev.Completion = undefined;
+    // This may require locking the poller based on how timers work...
+    timer.run(&scheduler.global.?.poller.loop, &completion, millis, SleepState, &sleep_state, struct {
+        fn callback(
+            state: ?*SleepState,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            result: xev.Timer.RunError!void,
+        ) xev.CallbackAction {
+            const c = state.?.*.coroutine;
+            c.state = .active;
+            state.?.*.result = result;
+            scheduler.global.?.poller.ready_coroutines.push(c);
+            return .disarm;
+        }
+    }.callback);
+
+    coro.await_completion(&completion);
+    log.debug("Loaded coroutine after sleep on thread: {}", .{scheduler.executor_index});
+    return sleep_state.result;
 }
 
 fn socket_read(socket: xev.TCP, buffer: []u8) xev.ReadError!usize {
