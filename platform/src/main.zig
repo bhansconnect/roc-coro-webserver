@@ -223,6 +223,9 @@ fn handle_request(socket: xev.TCP) void {
         };
     }
 
+    // TODO: reminder this is http 1.1, we could have read multiple requests at once in the buffer.
+    // If there is another request started in the buffer, we should loop back to keep reading.
+
     // TODO: Here we should close the socket if keep alive is off.
 
     // Return the socket to the idle pool.
