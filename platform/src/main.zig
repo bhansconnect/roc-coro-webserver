@@ -100,8 +100,9 @@ fn socket_set_idle(socket: xev.TCP) void {
     }
     idle_socket.next = null;
     idle_socket.socket = socket;
+    const idle_buffer = [_]u8{0};
     // Store the socket fd in the pointer to avoid any sort of extra allocation here.
-    socket.read(null, &idle_socket.completion, .{ .slice = &idle_socket.idle_buffer }, IdleSocket, idle_socket, struct {
+    socket.read(null, &idle_socket.completion, .{ .slice = idle_buffer[0..0] }, IdleSocket, idle_socket, struct {
         fn callback(
             idle_socket_inner: ?*IdleSocket,
             _: *xev.Loop,
@@ -118,25 +119,17 @@ fn socket_set_idle(socket: xev.TCP) void {
                 log.err("unhandled error {}", .{err});
                 return .disarm;
             };
-
-            var args = HandleRequestArgs{
-                .socket = idle_socket_inner.?.socket,
-                .idle_buffer = undefined,
-                .read_len = len,
-            };
-            // TODO: I assume copying all bytes of this small buffer is actually faster than doing a partial copy.
-            // Verify this.
-            std.mem.copyForwards(u8, &args.idle_buffer, &idle_socket_inner.?.idle_buffer);
+            std.debug.assert(len == 0);
 
             if (scheduler.global.?.poller.coroutine_pool.pop()) |c| {
-                c.reinit(HandleRequestArgs, handle_request, args);
+                c.reinit(xev.TCP, handle_request, idle_socket_inner.?.socket);
                 scheduler.global.?.poller.ready_coroutines.push(c);
                 scheduler.global.?.poller.idle_socket_pool.push(idle_socket_inner.?);
                 return .disarm;
             }
 
             // Need to allocate a new coroutine.
-            const c = Coroutine.init(HandleRequestArgs, handle_request, args) catch |err| {
+            const c = Coroutine.init(xev.TCP, handle_request, idle_socket_inner.?.socket) catch |err| {
                 log.err("Failed to create coroutine: {}", .{err});
                 // TODO: Should 500 and close socket.
                 return .disarm;
@@ -149,13 +142,7 @@ fn socket_set_idle(socket: xev.TCP) void {
     scheduler.global.?.poller.submission_queue.push(&idle_socket.completion);
 }
 
-const HandleRequestArgs = struct {
-    socket: xev.TCP,
-    idle_buffer: [poller.idle_buffer_size]u8,
-    read_len: usize,
-};
-
-fn handle_request(args: HandleRequestArgs) void {
+fn handle_request(socket: xev.TCP) void {
     // The goal here is to parse an http request for roc.
     // This needs to be robust and secure in the long run.
     // Basic steps:
@@ -176,12 +163,6 @@ fn handle_request(args: HandleRequestArgs) void {
     // 4. If a request headers are too big (16KB limit), simply fail it (also maybe limit body size).
     log.debug("Launched coroutine on thread: {}", .{scheduler.executor_index});
 
-    const socket = args.socket;
-    // TODO: I assume copying all bytes of this small buffer is actually faster than doing a partial copy.
-    // Verify this.
-    var buffer: [4096]u8 = undefined;
-    std.mem.copyForwards(u8, &buffer, &args.idle_buffer);
-
     // TODO: everything here needs timeouts.
 
     // This socket should be ready to go.
@@ -190,7 +171,8 @@ fn handle_request(args: HandleRequestArgs) void {
     // For now, just load the full request.
     // Also, do we need to worry about accidentally loading part of the next request?
     var scanned: usize = 0;
-    var full_len = args.read_len;
+    var full_len: usize = 0;
+    var buffer: [4096]u8 = undefined;
     // This double new line ends a header.
     const target = "\r\n\r\n";
     while (std.mem.indexOfPos(u8, buffer[0..full_len], scanned, target) == null) {
