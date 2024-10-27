@@ -102,6 +102,9 @@ fn socket_set_idle(socket: xev.TCP) void {
     idle_socket.socket = socket;
     const idle_buffer = [_]u8{0};
     // Store the socket fd in the pointer to avoid any sort of extra allocation here.
+    // TODO: this isn't really quite what we want.
+    // If data is ready, we want to skip this.
+    // Once this fires, we want to do our first read without any extra queueing.
     socket.read(null, &idle_socket.completion, .{ .slice = idle_buffer[0..0] }, IdleSocket, idle_socket, struct {
         fn callback(
             idle_socket_inner: ?*IdleSocket,
@@ -111,9 +114,14 @@ fn socket_set_idle(socket: xev.TCP) void {
             _: xev.ReadBuffer,
             result: xev.ReadError!usize,
         ) xev.CallbackAction {
-            const len = result catch |err| {
+            const len = result catch |err| brk: {
                 if (err == error.WouldBlock) {
                     return .rearm;
+                }
+                if (err == error.EOF) {
+                    // libxev returns EOF incorrectly with kqueue.
+                    // This is just cause we gave a zero byte read.
+                    break :brk 0;
                 }
                 // TODO: on error, properly close the socket.
                 log.err("unhandled error {}", .{err});
