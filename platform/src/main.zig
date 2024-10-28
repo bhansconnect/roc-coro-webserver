@@ -151,33 +151,9 @@ fn socket_set_idle(socket: xev.TCP) void {
 }
 
 fn handle_request(socket: xev.TCP) void {
-    // The goal here is to parse an http request for roc.
-    // This needs to be robust and secure in the long run.
-    // Basic steps:
-    // 1. Have a SWAR/SIMD scanner for for crln. Record the start of each line.
-    //     1.5. Can we have something at the same time scan that everything is valid utf8 or fail fast?
-    // 2. After the first new line, validate it is right http version and such. Fail fast if not.
-    // 3. Just keep scanning until a double newline is hit (headers all recieved).
-    // 4. Parse each header to ensure it is valid (maybe could be done with step 1?)
-    // 5. Find content length header (or in the future content encoding, but skipping that for now).
-    // 6. Allocate a buffer for the body if it doesn't fit directly in the header buffer (eventually reuse buffers).
-    // 7. Copy first chunk of body over to new buffer.
-    // 8. Recieve rest of body.
-    // 9. Get everything in roc format and call roc.
-    // Extra defense notes:
-    // 1. Everything needs a timeout and cancelation. This protects from things like sloworis.
-    // 2. We should generally fail fast, respond with an error, and close connections.
-    // 3. We need to be careful to block broken unicode and trick headers.
-    // 4. If a request headers are too big (16KB limit), simply fail it (also maybe limit body size).
     log.debug("Launched coroutine on thread: {}", .{scheduler.executor_index});
 
     // TODO: everything here needs timeouts.
-
-    // This socket should be ready to go.
-    // Lets give it a real buffer and load the headers/body.
-    // TODO: make this a lot smarter. Actually handle parsing.
-    // For now, just load the full request.
-    // Also, do we need to worry about accidentally loading part of the next request?
 
     // Rough simple parsing plan (ignoring timeout for now):
     // This will be a strict parser.
@@ -192,14 +168,21 @@ fn handle_request(socket: xev.TCP) void {
     // 4. While scan, check for host (it's required) and content length  (eventually support content encoding "chunked" required).
     //    - No content length is valid. Means no body
     // 5. Also scan for the keep alive state and mimetype.
-    // 6. For now, ignore any sort of compression and such.
+    // 6. For now, ignore any sort of compression and context encoding.
     // 7. In general be strict and fail fast if possible.
-    // This double new line ends a header.
+    //
     // After header is parsed, load in a loop until the body is parsed.
     // If everything fits in 16kb, just load in the buffer.
     // Otherwise, allocate a new buffer and load the full body in that (this buffer should be from a lifo perferably).
-    // Note: must give roc bytes or scan to ensure valid utf-8
-    // When in doubt 400 and close.
+    //
+    // Extra defense notes:
+    // 0. When in doubt 400 and close.
+    // 1. Everything needs a timeout and cancelation. This protects from things like sloworis.
+    // 2. We should generally fail fast, respond with an error, and close connections.
+    // 3. We need to be careful to block broken unicode and trick headers.
+    // 4. If a request headers are too big (16KB limit), simply fail it (also maybe limit body size).
+    // 5. must give roc bytes or scan to ensure valid utf-8
+
     var scanned: usize = 0;
     var buffer_len: usize = 0;
     var buffer: [16 * 1024]u8 align(@alignOf(u64)) = undefined;
