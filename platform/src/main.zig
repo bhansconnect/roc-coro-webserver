@@ -180,8 +180,29 @@ fn handle_request(socket: xev.TCP) void {
     // Also, do we need to worry about accidentally loading part of the next request?
     var scanned: usize = 0;
     var full_len: usize = 0;
-    var buffer: [4096]u8 = undefined;
+    var buffer: [16 * 1024]u8 = undefined;
+
+    // Rough simple parsing plan (ignoring timeout for now):
+    // This will be a strict parser.
+    // 0. It is fine to clear out extra empty lines before the starte line.
+    // 1. scan for "\r\n" and log them (limit max new lines in header to x)
+    //    - Optional, after first new line, validate core of request method, uri, and http version.
+    //    - Statically scan for method and limit to valid types (convert to enum).
+    //    - Zig static string map can be used for the method to enum conversion.
+    //    - Note, it is valid to just check for "\n" as long as we also check that their are no lone "\r" characters
+    // 2. On double newline, consider the header fully loaded and process it.
+    // 3. Split it line into key and value pairs for passing to roc.
+    // 4. While scan, check for host (it's required) and content length  (eventually support content encoding "chunked" required).
+    //    - No content length is valid. Means no body
+    // 5. Also scan for the keep alive state and mimetype.
+    // 6. For now, ignore any sort of compression and such.
+    // 7. In general be strict and fail fast if possible.
     // This double new line ends a header.
+    // After header is parsed, load in a loop until the body is parsed.
+    // If everything fits in 16kb, just load in the buffer.
+    // Otherwise, allocate a new buffer and load the full body in that (this buffer should be from a lifo perferably).
+    // Note: must give roc bytes or scan to ensure valid utf-8
+    // When in doubt 400 and close.
     const target = "\r\n\r\n";
     while (std.mem.indexOfPos(u8, buffer[0..full_len], scanned, target) == null) {
         scanned = full_len -| (target.len - 1);
