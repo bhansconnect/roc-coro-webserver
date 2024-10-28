@@ -178,9 +178,6 @@ fn handle_request(socket: xev.TCP) void {
     // TODO: make this a lot smarter. Actually handle parsing.
     // For now, just load the full request.
     // Also, do we need to worry about accidentally loading part of the next request?
-    var scanned: usize = 0;
-    var full_len: usize = 0;
-    var buffer: [16 * 1024]u8 = undefined;
 
     // Rough simple parsing plan (ignoring timeout for now):
     // This will be a strict parser.
@@ -203,16 +200,123 @@ fn handle_request(socket: xev.TCP) void {
     // Otherwise, allocate a new buffer and load the full body in that (this buffer should be from a lifo perferably).
     // Note: must give roc bytes or scan to ensure valid utf-8
     // When in doubt 400 and close.
-    const target = "\r\n\r\n";
-    while (std.mem.indexOfPos(u8, buffer[0..full_len], scanned, target) == null) {
-        scanned = full_len -| (target.len - 1);
-        if (full_len >= buffer.len) {
-            // TODO: send error if needed before closing the socket?
+    var scanned: usize = 0;
+    var buffer_len: usize = 0;
+    var buffer: [16 * 1024]u8 align(@alignOf(u64)) = undefined;
+
+    // TODO: decide what the max number of header newlines should be.
+    var new_lines: [128]u16 = undefined;
+    var new_lines_len: usize = 0;
+
+    load_header: while (true) {
+        if (buffer_len >= buffer.len) {
+            // Hit limit for max header size.
+            // TODO: send error before closing the socket
             socket_close(socket);
             return;
         }
 
-        const len = socket_read(socket, buffer[full_len..]) catch |err| {
+        // use swar (cause real simd is more complex and hardware specific) to scan for newlines.
+        // At the same time, scan for `\r`. Lone `\r` must return an error.
+        // TODO: should swar use u128 or u256? is u64 enough?
+        const r_needle: u64 = 0x0D0D_0D0D_0D0D_0D0D;
+        const n_needle: u64 = 0x0A0A_0A0A_0A0A_0A0A;
+        // This only moves by 7 cause we are scanning pairs of 2 bytes. So last byte can't be check in pair with byte after.
+        while (scanned + 7 < buffer_len) {
+            var bytes: u64 = undefined;
+            // TODO: is there a more efficient way to load this int?
+            @memcpy(std.mem.asBytes(&bytes), buffer[scanned .. scanned + 8]);
+
+            var r_match = ~(r_needle ^ bytes);
+            r_match &= r_match >> 1;
+            r_match &= r_match >> 2;
+            r_match &= r_match >> 4;
+            r_match &= 0x0101_0101_0101_0101;
+            // r_match is shifted to line up with n_match
+            const r_match_shift = r_match << 8;
+
+            var n_match = ~(n_needle ^ bytes);
+            n_match &= n_match >> 1;
+            n_match &= n_match >> 2;
+            n_match &= n_match >> 4;
+            n_match &= 0x0101_0101_0101_0101;
+
+            const bare_r_or_n = r_match_shift ^ n_match;
+            if (bare_r_or_n != 0) {
+                // Invalid: bare `\r` not allowed.
+                // At least for now, we are also a strict parser. So bare `\n` is invalid as well.
+                // TODO: send error before closing the socket
+                socket_close(socket);
+                return;
+            }
+            const rn_match = r_match_shift & n_match;
+            if (rn_match == 0) {
+                // No match at all, increment by 8 if no `\r`, otherwise by 7 for trailing `\r`.
+                scanned += @intFromBool(r_match == 0);
+                scanned += 7;
+                continue;
+            }
+
+            // We have a `\r\n`. Log the newline and only increment just past it.
+            const n_offset = scanned + @ctz(n_match) / 8;
+            const line_start = n_offset + 1;
+            scanned = line_start;
+            if (new_lines_len >= new_lines.len) {
+                // Hit max number of new lines for a header.
+                // TODO: send error before closing the socket
+                socket_close(socket);
+                return;
+            }
+            new_lines[new_lines_len] = @intCast(line_start);
+            new_lines_len += 1;
+
+            if (new_lines[new_lines_len -| 2] == (new_lines[new_lines_len - 1] - 2)) {
+                // Two newlines in a row.
+                // Full header loaded.
+                break :load_header;
+            }
+        }
+
+        // Scan final tail 1 byte at a time.
+        while (scanned + 1 < buffer_len) {
+            if (buffer[scanned] == '\r') {
+                if (buffer[scanned + 1] != '\n') {
+                    // Invalid: bare `\r` not allowed.
+                    // At least for now, we are also a strict parser. So bare `\n` is invalid as well.
+                    // TODO: send error before closing the socket
+                    socket_close(socket);
+                    return;
+                }
+
+                // We have a `\r\n`. Log the newline and only increment just past it.
+                const line_start = scanned + 2;
+                scanned = line_start;
+                if (new_lines_len >= new_lines.len) {
+                    // Hit max number of new lines for a header.
+                    // TODO: send error before closing the socket
+                    socket_close(socket);
+                    return;
+                }
+                new_lines[new_lines_len] = @intCast(line_start);
+                new_lines_len += 1;
+
+                if (new_lines[new_lines_len -| 2] == (new_lines[new_lines_len - 1] - 2)) {
+                    // Two newlines in a row.
+                    // Full header loaded.
+                    break :load_header;
+                }
+                continue;
+            } else if (buffer[scanned] == '\n') {
+                // At least for now, we are also a strict parser. So bare `\n` is invalid as well.
+                // TODO: send error before closing the socket
+                socket_close(socket);
+                return;
+            }
+            scanned += 1;
+        }
+
+        // No end to the header yet. Read more data.
+        buffer_len += socket_read(socket, buffer[buffer_len..]) catch |err| {
             if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
                 log.warn("Failed to read from tcp connection: {}", .{err});
             }
@@ -220,9 +324,8 @@ fn handle_request(socket: xev.TCP) void {
             socket_close(socket);
             return;
         };
-        full_len += len;
     }
-    log.debug("Request:\n{s}\n\n", .{buffer[0..full_len]});
+    log.debug("Request:\n{s}", .{buffer[0..buffer_len]});
 
     // TODO: Call into roc and setup a basic web request in roc to get the response.
 
