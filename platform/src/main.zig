@@ -183,14 +183,26 @@ fn handle_request(socket: xev.TCP) void {
     // 4. If a request headers are too big (16KB limit), simply fail it (also maybe limit body size).
     // 5. must give roc bytes or scan to ensure valid utf-8
 
-    var scanned: usize = 0;
     var buffer_len: usize = 0;
     var buffer: [16 * 1024]u8 align(@alignOf(u64)) = undefined;
+
+    // Kick off the first read.
+    // We have an empty buffer and the os is ready.
+    // Theoretically this could be a direct read without the poller.
+    buffer_len += socket_read(socket, buffer[buffer_len..]) catch |err| {
+        if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
+            log.warn("Failed to read from tcp connection: {}", .{err});
+        }
+        // TODO: send error if needed before closing the socket?
+        socket_close(socket);
+        return;
+    };
 
     // TODO: decide what the max number of header newlines should be.
     var new_lines: [128]u16 = undefined;
     var new_lines_len: usize = 0;
 
+    var scanned: usize = 0;
     load_header: while (true) {
         if (buffer_len >= buffer.len) {
             // Hit limit for max header size.
