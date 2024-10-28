@@ -198,19 +198,42 @@ fn handle_request(socket: xev.TCP) void {
         return;
     };
 
-    // TODO: decide what the max number of header newlines should be.
-    var new_lines: [128]u16 = undefined;
-    var new_lines_len: usize = 0;
+    // TODO: decide what the max number of header lines should be.
+    var header_lines: [128]u16 = undefined;
+    var header_lines_len: usize = 0;
 
     var scanned: usize = 0;
-    load_header: while (true) {
-        if (buffer_len >= buffer.len) {
+    skip_blanks: while (true) {
+        // This should be pretty dang rare.
+        // HTTP spec recommends skipping at least 1 of these.
+        // We will skip all of them.
+        while (scanned + 1 < buffer_len) : (scanned += 2) {
+            const rn_match = buffer[scanned] == '\r' and buffer[scanned + 1] == '\n';
+            if (!rn_match) {
+                break :skip_blanks;
+            }
+        }
+
+        if (buffer_len == buffer.len) {
             // Hit limit for max header size.
             // TODO: send error before closing the socket
             socket_close(socket);
             return;
         }
+        // Still in new lines. Read more data.
+        buffer_len += socket_read(socket, buffer[buffer_len..]) catch |err| {
+            if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
+                log.warn("Failed to read from tcp connection: {}", .{err});
+            }
+            // TODO: send error if needed before closing the socket?
+            socket_close(socket);
+            return;
+        };
+    }
+    header_lines[0] = @intCast(scanned);
+    header_lines_len = 1;
 
+    load_header: while (true) {
         // use swar (cause real simd is more complex and hardware specific) to scan for newlines.
         // At the same time, scan for `\r`. Lone `\r` must return an error.
         // TODO: should swar use u128 or u256? is u64 enough?
@@ -256,16 +279,16 @@ fn handle_request(socket: xev.TCP) void {
             const n_offset = scanned + @ctz(n_match) / 8;
             const line_start = n_offset + 1;
             scanned = line_start;
-            if (new_lines_len >= new_lines.len) {
+            if (header_lines_len >= header_lines.len) {
                 // Hit max number of new lines for a header.
                 // TODO: send error before closing the socket
                 socket_close(socket);
                 return;
             }
-            new_lines[new_lines_len] = @intCast(line_start);
-            new_lines_len += 1;
+            header_lines[header_lines_len] = @intCast(line_start);
+            header_lines_len += 1;
 
-            if (new_lines[new_lines_len -| 2] == (new_lines[new_lines_len - 1] - 2)) {
+            if (header_lines[header_lines_len -| 2] == (header_lines[header_lines_len - 1] - 2)) {
                 // Two newlines in a row.
                 // Full header loaded.
                 break :load_header;
@@ -286,16 +309,16 @@ fn handle_request(socket: xev.TCP) void {
                 // We have a `\r\n`. Log the newline and only increment just past it.
                 const line_start = scanned + 2;
                 scanned = line_start;
-                if (new_lines_len >= new_lines.len) {
+                if (header_lines_len >= header_lines.len) {
                     // Hit max number of new lines for a header.
                     // TODO: send error before closing the socket
                     socket_close(socket);
                     return;
                 }
-                new_lines[new_lines_len] = @intCast(line_start);
-                new_lines_len += 1;
+                header_lines[header_lines_len] = @intCast(line_start);
+                header_lines_len += 1;
 
-                if (new_lines[new_lines_len -| 2] == (new_lines[new_lines_len - 1] - 2)) {
+                if (header_lines[header_lines_len -| 2] == (header_lines[header_lines_len - 1] - 2)) {
                     // Two newlines in a row.
                     // Full header loaded.
                     break :load_header;
@@ -310,6 +333,13 @@ fn handle_request(socket: xev.TCP) void {
             scanned += 1;
         }
 
+        if (buffer_len == buffer.len) {
+            // Hit limit for max header size.
+            // TODO: send error before closing the socket
+            socket_close(socket);
+            return;
+        }
+
         // No end to the header yet. Read more data.
         buffer_len += socket_read(socket, buffer[buffer_len..]) catch |err| {
             if (err != error.ConnectionReset and err != error.ConnectionResetByPeer and err != error.EOF) {
@@ -321,6 +351,7 @@ fn handle_request(socket: xev.TCP) void {
         };
     }
     log.debug("Request:\n{s}", .{buffer[0..buffer_len]});
+    log.debug("header lines: {any}", .{header_lines[0..header_lines_len]});
 
     // TODO: Call into roc and setup a basic web request in roc to get the response.
 
