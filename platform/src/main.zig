@@ -194,6 +194,7 @@ fn handle_request(socket: xev.TCP) void {
             log.warn("Failed to read from tcp connection: {}", .{err});
         }
         // TODO: send error if needed before closing the socket?
+        log.err("close: failed to read", .{});
         socket_close(socket);
         return;
     };
@@ -217,6 +218,7 @@ fn handle_request(socket: xev.TCP) void {
         if (buffer_len == buffer.len) {
             // Hit limit for max header size.
             // TODO: send error before closing the socket
+            log.err("close: max size too large", .{});
             socket_close(socket);
             return;
         }
@@ -226,6 +228,7 @@ fn handle_request(socket: xev.TCP) void {
                 log.warn("Failed to read from tcp connection: {}", .{err});
             }
             // TODO: send error if needed before closing the socket?
+            log.err("close: failed to read", .{});
             socket_close(socket);
             return;
         };
@@ -264,6 +267,7 @@ fn handle_request(socket: xev.TCP) void {
                 // Invalid: bare `\r` not allowed.
                 // At least for now, we are also a strict parser. So bare `\n` is invalid as well.
                 // TODO: send error before closing the socket
+                log.err("close: bare \\r or \\n", .{});
                 socket_close(socket);
                 return;
             }
@@ -282,6 +286,7 @@ fn handle_request(socket: xev.TCP) void {
             if (header_lines_len >= header_lines.len) {
                 // Hit max number of new lines for a header.
                 // TODO: send error before closing the socket
+                log.err("close: too many lines", .{});
                 socket_close(socket);
                 return;
             }
@@ -302,6 +307,7 @@ fn handle_request(socket: xev.TCP) void {
                     // Invalid: bare `\r` not allowed.
                     // At least for now, we are also a strict parser. So bare `\n` is invalid as well.
                     // TODO: send error before closing the socket
+                    log.err("close: bare \\r", .{});
                     socket_close(socket);
                     return;
                 }
@@ -312,6 +318,7 @@ fn handle_request(socket: xev.TCP) void {
                 if (header_lines_len >= header_lines.len) {
                     // Hit max number of new lines for a header.
                     // TODO: send error before closing the socket
+                    log.err("close: too many lines", .{});
                     socket_close(socket);
                     return;
                 }
@@ -327,6 +334,7 @@ fn handle_request(socket: xev.TCP) void {
             } else if (buffer[scanned] == '\n') {
                 // At least for now, we are also a strict parser. So bare `\n` is invalid as well.
                 // TODO: send error before closing the socket
+                log.err("close: bare \\n", .{});
                 socket_close(socket);
                 return;
             }
@@ -336,6 +344,7 @@ fn handle_request(socket: xev.TCP) void {
         if (buffer_len == buffer.len) {
             // Hit limit for max header size.
             // TODO: send error before closing the socket
+            log.err("close: max size too large", .{});
             socket_close(socket);
             return;
         }
@@ -346,11 +355,12 @@ fn handle_request(socket: xev.TCP) void {
                 log.warn("Failed to read from tcp connection: {}", .{err});
             }
             // TODO: send error if needed before closing the socket?
+            log.err("close: failed to read", .{});
             socket_close(socket);
             return;
         };
     }
-    log.debug("Request:\n{s}", .{buffer[0..buffer_len]});
+    log.debug("request headers:\n{s}", .{buffer[0..scanned]});
     log.debug("header lines: {any}", .{header_lines[0..header_lines_len]});
 
     // TODO: Call into roc and setup a basic web request in roc to get the response.
@@ -373,10 +383,10 @@ fn handle_request(socket: xev.TCP) void {
         };
     }
 
+    // TODO: Here we should close the socket if keep alive is off.
+
     // TODO: reminder this is http 1.1, we could have read multiple requests at once in the buffer.
     // If there is another request started in the buffer, we should loop back to keep reading.
-
-    // TODO: Here we should close the socket if keep alive is off.
 
     // Return the socket to the idle pool.
     socket_set_idle(socket);
