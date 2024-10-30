@@ -150,6 +150,20 @@ fn socket_set_idle(socket: xev.TCP) void {
     scheduler.global.?.poller.submission_queue.push(&idle_socket.completion);
 }
 
+const StrU8Map = std.StaticStringMap(u8);
+const StrU8 = struct { []const u8, u8 };
+const method_to_enum = StrU8Map.initComptime([_]StrU8{
+    .{ "CONNECT", 0 },
+    .{ "DELETE", 1 },
+    .{ "GET", 2 },
+    .{ "HEAD", 3 },
+    .{ "OPTIONS", 4 },
+    .{ "PATCH", 5 },
+    .{ "POST", 6 },
+    .{ "PUT", 7 },
+    .{ "TRACE", 8 },
+});
+
 fn handle_request(socket: xev.TCP) void {
     log.debug("Launched coroutine on thread: {}", .{scheduler.executor_index});
 
@@ -182,6 +196,8 @@ fn handle_request(socket: xev.TCP) void {
     // 3. We need to be careful to block broken unicode and trick headers.
     // 4. If a request headers are too big (16KB limit), simply fail it (also maybe limit body size).
     // 5. must give roc bytes or scan to ensure valid utf-8
+
+    // TODO: actually use some functions and clean up this repetitive mess.
 
     var buffer_len: usize = 0;
     var buffer: [16 * 1024]u8 align(@alignOf(u64)) = undefined;
@@ -362,6 +378,49 @@ fn handle_request(socket: xev.TCP) void {
     }
     log.debug("request headers:\n{s}", .{buffer[0..scanned]});
     log.debug("header lines: {any}", .{header_lines[0..header_lines_len]});
+
+    // Parse the request line.
+    // This could probably use swar or simd, but I just want it to be simple.
+    // Don't need it to be long like the above right now.
+    // `-2` used below is used to
+    const request_line = buffer[header_lines[0] .. header_lines[1] - 2];
+    var it = std.mem.splitScalar(u8, request_line, ' ');
+    const method = it.first();
+    const uri = it.next();
+    const version = it.next();
+    if (uri == null or version == null or it.next() != null) {
+        // First line is incorrect either missing a required elements or has extra elements.
+        // TODO: send 400
+        log.err("close: bad request line: {s}", .{request_line});
+        socket_close(socket);
+        return;
+    }
+    var method_enum: u8 = 0;
+    if (method_to_enum.get(method)) |e| {
+        method_enum = e;
+    } else {
+        // TODO: send 400
+        log.err("close: bad method: {s}", .{method});
+        socket_close(socket);
+        return;
+    }
+    const subversion = version.?[version.?.len - 1];
+    const good_subversion = subversion == '0' or subversion == '1';
+    if (!std.mem.eql(u8, version.?[0 .. version.?.len - 1], "HTTP/1.") or !good_subversion) {
+        // TODO: send 400
+        log.err("close: bad http version: {s}", .{method});
+        socket_close(socket);
+        return;
+    }
+
+    // TODO: handle uri validation.
+
+    for (1..(header_lines_len - 1)) |i| {
+        const line = buffer[header_lines[i]..header_lines[i + 1]];
+        _ = line;
+        // TODO: build up k v pair slices.
+        // Maybe also check for key headers (content-length, host)
+    }
 
     // TODO: Call into roc and setup a basic web request in roc to get the response.
 
