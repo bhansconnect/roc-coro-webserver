@@ -216,7 +216,8 @@ fn handle_request(socket: xev.TCP) void {
     };
 
     // TODO: decide what the max number of header lines should be.
-    var header_lines: [128]u16 = undefined;
+    const MAX_HEADER_LINES = 128;
+    var header_lines: [MAX_HEADER_LINES]u16 = undefined;
     var header_lines_len: usize = 0;
 
     var scanned: usize = 0;
@@ -382,7 +383,7 @@ fn handle_request(socket: xev.TCP) void {
     // Parse the request line.
     // This could probably use swar or simd, but I just want it to be simple.
     // Don't need it to be long like the above right now.
-    // `-2` used below is used to
+    // `-2` used below is used to avoid the trailing `\r\n`.
     const request_line = buffer[header_lines[0] .. header_lines[1] - 2];
     var it = std.mem.splitScalar(u8, request_line, ' ');
     const method = it.first();
@@ -415,12 +416,34 @@ fn handle_request(socket: xev.TCP) void {
 
     // TODO: handle uri validation.
 
-    for (1..(header_lines_len - 1)) |i| {
-        const line = buffer[header_lines[i]..header_lines[i + 1]];
-        _ = line;
-        // TODO: build up k v pair slices.
-        // Maybe also check for key headers (content-length, host)
+    // These will be RocList or RocStr in the future.
+    const Header = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+    // `-1` for request line. `-2` for trailing empty lines.
+    const headers_len = header_lines_len - 3;
+    var headers: [MAX_HEADER_LINES]Header = undefined;
+    for (0..headers_len) |i| {
+        // `-2` used below is used to avoid the trailing `\r\n`.
+        const line = buffer[header_lines[i + 1]..(header_lines[i + 2] - 2)];
+
+        // TODO: actually validate the characters here. for example null is not valid here.
+        // Also, if we want them to be roc strings, they need to be utf-8.
+        it = std.mem.splitScalar(u8, line, ':');
+        const key = it.first();
+        const value = std.mem.trim(u8, it.rest(), &[_]u8{ ' ', '\t' });
+
+        headers[i] = .{ .key = key, .value = value };
     }
+
+    for (headers[0..headers_len]) |h| {
+        log.debug("header -> {s}:{s}", .{ h.key, h.value });
+    }
+
+    // TODO: ensure we have a Host header and reconstruct url.
+    // TODO: check keep alive status.
+    // TODO: check for countent length and load the full body.
 
     // TODO: Call into roc and setup a basic web request in roc to get the response.
 
