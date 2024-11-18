@@ -1,5 +1,6 @@
 profile.json
 bench-against
+bench-against.roc
 
 .zig-cache
 zig-cache
