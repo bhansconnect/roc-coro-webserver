@@ -24,7 +24,7 @@
     // internet connectivity.
     .dependencies = .{
         .libxev = .{
-            .path = "vendor/libxev",
+            .path = "platform/host/vendor/libxev",
         },
     },
     .paths = .{

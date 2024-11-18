@@ -1,2 +1,10 @@
 profile.json
 bench-against
+
+.zig-cache
+zig-cache
+zig-out
+
+flamegraph.svg
+perf.data
+perf.data.old

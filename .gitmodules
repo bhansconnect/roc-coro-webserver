@@ -1,3 +1,6 @@
 [submodule "platform/vendor/libxev"]
 	path = platform/vendor/libxev
 	url = git@github.com:bhansconnect/libxev.git
+[submodule "platform/host/vendor/libxev"]
+	path = platform/host/vendor/libxev
+	url = git@github.com:bhansconnect/libxev.git
