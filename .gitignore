@@ -9,3 +9,5 @@ zig-out
 flamegraph.svg
 perf.data
 perf.data.old
+
+*.ll

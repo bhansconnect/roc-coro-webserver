@@ -28,19 +28,26 @@ pub fn main() !void {
 
     // Run `roc check`
     const roc_check_args = [_][]const u8{ "roc", "check", app_name };
-    const roc_check = try std.ChildProcess.exec(.{
-        .allocator = allocator,
-        .argv = &roc_check_args,
-    });
-    defer allocator.free(roc_check.stdout);
-    defer allocator.free(roc_check.stderr);
+    var roc_check = std.process.Child.init(
+        &roc_check_args,
+        allocator,
+    );
+    roc_check.stdout_behavior = .Pipe;
+    roc_check.stderr_behavior = .Pipe;
+    try roc_check.spawn();
+    var roc_check_stdout = std.ArrayList(u8).init(allocator);
+    var roc_check_stderr = std.ArrayList(u8).init(allocator);
+    defer roc_check_stdout.deinit();
+    defer roc_check_stderr.deinit();
+    try roc_check.collectOutput(&roc_check_stdout, &roc_check_stderr, 4096);
+    const roc_check_term = try roc_check.wait();
 
-    const roc_check_success = roc_check.term.Exited == 0;
-    const roc_check_warning = roc_check.term.Exited == 2;
+    const roc_check_success = roc_check_term.Exited == 0;
+    const roc_check_warning = roc_check_term.Exited == 2;
     // On the error case, print the output of `roc check` and return and err.
     if (!roc_check_success and !roc_check_warning) {
-        try stdout.print("{s}", .{roc_check.stdout});
-        try stderr.print("{s}", .{roc_check.stderr});
+        try stdout.print("{s}", .{roc_check_stdout.items});
+        try stderr.print("{s}", .{roc_check_stderr.items});
         std.process.exit(1);
     }
 
@@ -48,24 +55,31 @@ pub fn main() !void {
     // Proceed to `roc build`
     var roc_build_args = try std.ArrayList([]const u8).initCapacity(allocator, 10);
     defer roc_build_args.deinit();
-    try roc_build_args.appendSlice(&[_][]const u8{ "roc", "build", "--target", "wasm32", "--no-link", "--output", "zig-cache/app.o" });
+    try roc_build_args.appendSlice(&[_][]const u8{ "roc", "build", "--no-link", "--output", ".zig-cache/app.o" });
     if (optimize_flag.len != 0) {
         try roc_build_args.append(optimize_flag);
     }
     try roc_build_args.append(app_name);
-    const roc_build = try std.ChildProcess.exec(.{
-        .allocator = allocator,
-        .argv = roc_build_args.items,
-    });
-    defer allocator.free(roc_build.stdout);
-    defer allocator.free(roc_build.stderr);
+    var roc_build = std.process.Child.init(
+        roc_build_args.items,
+        allocator,
+    );
+    roc_build.stdout_behavior = .Pipe;
+    roc_build.stderr_behavior = .Pipe;
+    try roc_build.spawn();
+    var roc_build_stdout = std.ArrayList(u8).init(allocator);
+    var roc_build_stderr = std.ArrayList(u8).init(allocator);
+    defer roc_build_stdout.deinit();
+    defer roc_build_stderr.deinit();
+    try roc_build.collectOutput(&roc_build_stdout, &roc_build_stderr, 4096);
+    const roc_build_term = try roc_build.wait();
 
     // For roc build, we always output all of stdout and stderr, but only fail on errors.
-    try stdout.print("{s}", .{roc_build.stdout});
-    try stderr.print("{s}", .{roc_build.stderr});
+    try stdout.print("{s}", .{roc_build_stdout.items});
+    try stderr.print("{s}", .{roc_build_stderr.items});
 
-    const roc_build_success = roc_build.term.Exited == 0;
-    const roc_build_warning = roc_build.term.Exited == 2;
+    const roc_build_success = roc_build_term.Exited == 0;
+    const roc_build_warning = roc_build_term.Exited == 2;
     if (!roc_build_success and !roc_build_warning) {
         std.process.exit(1);
     }

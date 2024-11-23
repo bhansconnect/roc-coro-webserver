@@ -4,6 +4,10 @@ const coro = @import("coro.zig");
 const scheduler = @import("scheduler.zig");
 const poller = @import("poller.zig");
 
+const libc = @cImport({
+    @cInclude("stdlib.h");
+});
+
 const Allocator = std.mem.Allocator;
 const Coroutine = coro.Coroutine;
 const Scheduler = scheduler.Scheduler;
@@ -27,14 +31,15 @@ pub const std_options: std.Options = .{
 
 // TODO: evaluate if GPA is slow and hurting perf.
 // Might be better to use the c allocator or https://github.com/joadnacer/jdz_allocator/
-var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
-var allocator: Allocator = gpa.allocator();
+// var gpa: std.heap.GeneralPurposeAllocator(.{ .safety = false, .thread_safe = true }) = .{};
+// var allocator: Allocator = gpa.allocator();
+var allocator: Allocator = std.heap.c_allocator;
 
 pub fn main() !void {
     try scheduler.init_global(allocator, .{ .num_executors = try std.Thread.getCpuCount() / 2 });
 
     // Setup the socket.
-    var address = try std.net.Address.parseIp4("127.0.0.1", 8000);
+    var address = try std.net.Address.parseIp4("0.0.0.0", 8000);
     const server = try xev.TCP.init(address);
     try server.bind(address);
     try server.listen(128);
@@ -124,7 +129,9 @@ fn socket_set_idle(socket: xev.TCP) void {
                     break :brk 0;
                 }
                 // TODO: on error, properly close the socket.
-                log.err("unhandled error {}", .{err});
+                if (err != error.ConnectionReset and err != error.ConnectionResetByPeer) {
+                    log.err("unhandled error {}", .{err});
+                }
                 return .disarm;
             };
             std.debug.assert(len == 0);
@@ -210,7 +217,6 @@ fn handle_request(socket: xev.TCP) void {
             log.warn("Failed to read from tcp connection: {}", .{err});
         }
         // TODO: send error if needed before closing the socket?
-        log.err("close: failed to read", .{});
         socket_close(socket);
         return;
     };
@@ -245,7 +251,6 @@ fn handle_request(socket: xev.TCP) void {
                 log.warn("Failed to read from tcp connection: {}", .{err});
             }
             // TODO: send error if needed before closing the socket?
-            log.err("close: failed to read", .{});
             socket_close(socket);
             return;
         };
@@ -372,7 +377,6 @@ fn handle_request(socket: xev.TCP) void {
                 log.warn("Failed to read from tcp connection: {}", .{err});
             }
             // TODO: send error if needed before closing the socket?
-            log.err("close: failed to read", .{});
             socket_close(socket);
             return;
         };
@@ -446,9 +450,17 @@ fn handle_request(socket: xev.TCP) void {
     // TODO: check for countent length and load the full body.
 
     // TODO: Call into roc and setup a basic web request in roc to get the response.
+    const out = roc__respondBoxed_1_exposed(RocStr{ .ptr = null, .len = 0, .cap = 0 });
+    defer roc_str_decref(&out);
+    const bytes = roc_str_bytes(&out);
 
-    const response =
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 13\r\n\r\nHello, World!";
+    const response = std.fmt.allocPrint(allocator, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n{s}", .{ bytes.len, bytes }) catch |err| {
+        // TODO: send 400
+        log.err("failed to write response buffer: {?}", .{err});
+        socket_close(socket);
+        return;
+    };
+    defer allocator.free(response);
 
     var write_len: usize = 0;
     // TODO: handle partial reads.
@@ -544,6 +556,40 @@ fn socket_write(socket: xev.TCP, buffer: []const u8) xev.WriteError!usize {
     return write_state.result;
 }
 
+fn sleep(millis: u64) xev.Timer.RunError!void {
+    const SleepState = struct {
+        coroutine: *Coroutine,
+        result: xev.Timer.RunError!void,
+    };
+    var sleep_state = SleepState{
+        .coroutine = coro.current_coroutine.?,
+        .result = undefined,
+    };
+    var completion: xev.Completion = undefined;
+    // This should be safe with some of my modifications.
+    // At least on kqueue and epoll only looks to access a cached time...
+    // Might need a lock though to actually be correct.
+    var timer = try xev.Timer.init();
+    defer timer.deinit();
+    timer.run(&scheduler.global.?.poller.loop, &completion, millis, SleepState, &sleep_state, struct {
+        fn callback(
+            state: ?*SleepState,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            result: xev.Timer.RunError!void,
+        ) xev.CallbackAction {
+            const c = state.?.*.coroutine;
+            c.state = .active;
+            state.?.*.result = result;
+            scheduler.global.?.poller.ready_coroutines.push(c);
+            return .disarm;
+        }
+    }.callback);
+    coro.await_completion(&completion);
+    log.debug("Loaded coroutine after sleep on thread: {}", .{scheduler.executor_index});
+    return sleep_state.result;
+}
+
 fn socket_close(socket: xev.TCP) void {
     var completion: xev.Completion = undefined;
     socket.close(null, &completion, coro.Coroutine, coro.current_coroutine, struct {
@@ -561,4 +607,84 @@ fn socket_close(socket: xev.TCP) void {
     }.callback);
     coro.await_completion(&completion);
     log.debug("Loaded coroutine after close on thread: {}", .{scheduler.executor_index});
+}
+
+// All the roc... at least for now...
+const RocStr = extern struct {
+    ptr: ?*u8,
+    len: u64,
+    cap: i64,
+};
+
+fn roc_str_bytes(str: *const RocStr) []const u8 {
+    if (str.cap < 0) {
+        // Is a small str.
+        const bytes: [*]const u8 = @ptrCast(str);
+        const len = bytes[@sizeOf(RocStr) - 1] & 0x7F;
+        return bytes[0..len];
+    } else {
+        const bytes: [*]const u8 = @ptrCast(str.ptr.?);
+        const len = str.len & 0x7FFF_FFFF_FFFF_FFFF;
+        return bytes[0..len];
+    }
+}
+
+const REFCOUNT_MAX: isize = 0;
+pub const REFCOUNT_ONE: isize = std.math.minInt(isize);
+
+fn roc_str_decref(str: *const RocStr) void {
+    if (str.cap < 0) {
+        // Is a small str.
+        return;
+    }
+
+    const rc: *isize = @ptrFromInt(@intFromPtr(str.ptr.?) - 8);
+    if (rc.* == REFCOUNT_MAX) {
+        // Constant refcount.
+        return;
+    }
+    if (rc.* == REFCOUNT_ONE) {
+        roc_dealloc(rc, 0);
+        return;
+    }
+
+    rc.* -= 1;
+}
+
+extern fn roc__respondBoxed_1_exposed(RocStr) callconv(.C) RocStr;
+
+export fn roc_fx_sleepMillis(ms: u64) void {
+    sleep(ms) catch @panic("failed to sleep");
+}
+
+export fn roc_alloc(requested_size: usize, _: u32) callconv(.C) ?*anyopaque {
+    return libc.malloc(requested_size);
+}
+
+export fn roc_realloc(old_ptr: [*]u8, new_size: usize, _: usize, _: u32) callconv(.C) ?*anyopaque {
+    return libc.realloc(old_ptr, new_size);
+}
+
+export fn roc_dealloc(ptr: *anyopaque, _: u32) callconv(.C) void {
+    return libc.free(ptr);
+}
+
+export fn roc_panic(msg: *RocStr, _: u32) callconv(.C) void {
+    _ = msg;
+    @panic("ROC PANICKED");
+}
+
+export fn roc_dbg(loc: *RocStr, msg: *RocStr, src: *RocStr) callconv(.C) void {
+    _ = src;
+    _ = msg;
+    _ = loc;
+    @panic("TODO");
+    // var loc0 = str.strConcatC(loc.*, RocStr.fromSlice(&[1]u8{0}));
+    // defer loc0.decref();
+    // var msg0 = str.strConcatC(msg.*, RocStr.fromSlice(&[1]u8{0}));
+    // defer msg0.decref();
+    // var src0 = str.strConcatC(src.*, RocStr.fromSlice(&[1]u8{0}));
+    // defer src0.decref();
+
+    // w4.tracef("[%s] %s = %s\n", loc0.asU8ptr(), src0.asU8ptr(), msg0.asU8ptr());
 }
