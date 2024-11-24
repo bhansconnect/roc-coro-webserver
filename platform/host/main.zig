@@ -36,7 +36,9 @@ pub const std_options: std.Options = .{
 var allocator: Allocator = std.heap.c_allocator;
 
 pub fn main() !void {
-    try scheduler.init_global(allocator, .{ .num_executors = try std.Thread.getCpuCount() / 2 });
+    try scheduler.init_global(allocator, .{
+        .num_executors = try std.Thread.getCpuCount(),
+    });
 
     // Setup the socket.
     var address = try std.net.Address.parseIp4("0.0.0.0", 8000);
